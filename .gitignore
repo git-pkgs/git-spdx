@@ -1,0 +1,4 @@
+/git-spdx
+*.pprof
+/bench-results.txt
+/.ruby-lsp/
