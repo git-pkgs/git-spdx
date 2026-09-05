@@ -23,15 +23,17 @@ import (
 )
 
 const (
-	maxBlobSize   = 1 << 20
-	zeroOID       = "0000000000000000000000000000000000000000"
-	zeroOIDSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+	defaultMaxBlobSize = 1 << 20
+	zeroOID            = "0000000000000000000000000000000000000000"
+	zeroOIDSHA256      = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 var (
-	cpuProfile = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
-	memProfile = flag.String("memprofile", "", "write heap profile after the blob scan to file")
-	backend    = flag.String("backend", "git", "object reader: git (cat-file) or gogit")
+	cpuProfile  = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
+	memProfile  = flag.String("memprofile", "", "write heap profile after the blob scan to file")
+	backend     = flag.String("backend", "git", "object reader: git (cat-file) or gogit")
+	maxBlobSize = flag.Int64("max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
+	readers     = flag.Int("readers", 0, "cat-file reader processes (0 = GOMAXPROCS)")
 )
 
 func main() {
@@ -77,8 +79,10 @@ type blobResult struct {
 }
 
 type index struct {
-	mu    sync.RWMutex
-	blobs map[string]blobResult
+	mu       sync.RWMutex
+	blobs    map[string]blobResult
+	interned map[string]string
+	skipped  int
 }
 
 func (x *index) get(oid string) (blobResult, bool) {
@@ -88,8 +92,26 @@ func (x *index) get(oid string) (blobResult, bool) {
 	return r, ok
 }
 
+// put stores only blobs with detections; absence means scanned and empty.
+// Expression strings are interned so repeated values share storage.
 func (x *index) put(oid string, r blobResult) {
+	if r.skipped != "" {
+		x.mu.Lock()
+		x.skipped++
+		x.mu.Unlock()
+		return
+	}
+	if len(r.expressions) == 0 {
+		return
+	}
 	x.mu.Lock()
+	for i, e := range r.expressions {
+		if s, ok := x.interned[e]; ok {
+			r.expressions[i] = s
+		} else {
+			x.interned[e] = e
+		}
+	}
 	x.blobs[oid] = r
 	x.mu.Unlock()
 }
@@ -119,7 +141,7 @@ func scan(repo string) error {
 		}()
 	}
 
-	idx := &index{blobs: make(map[string]blobResult, 1<<16)}
+	idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
 	stats, err := scanBlobs(ctx, repo, m, idx)
 	if err != nil {
 		return err
@@ -196,6 +218,10 @@ func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *i
 				if r.skipped == "binary" {
 					stats.skipBinary++
 				}
+				if stats.matched%200_000 == 0 {
+					fmt.Fprintf(os.Stderr, "  %d blobs, %s, %s\n",
+						stats.matched, human(stats.bytes), time.Since(t0).Round(time.Second))
+				}
 				mu.Unlock()
 			}
 		}()
@@ -233,10 +259,11 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string)) (int, err
 	if err != nil {
 		return 0, err
 	}
-	shards := min(runtime.GOMAXPROCS(0), len(oids))
-	if shards < 1 {
-		shards = 1
+	shards := *readers
+	if shards <= 0 {
+		shards = runtime.GOMAXPROCS(0)
 	}
+	shards = max(1, min(shards, len(oids)))
 	var wg sync.WaitGroup
 	errs := make(chan error, shards)
 	for s := 0; s < shards; s++ {
@@ -258,7 +285,7 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string)) (int, err
 				if typ != "blob" {
 					continue
 				}
-				if size > maxBlobSize {
+				if int64(size) > *maxBlobSize {
 					skip(oids[i])
 					continue
 				}
@@ -297,7 +324,7 @@ func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string)) (int, error
 		}
 		total++
 		oid := obj.Hash().String()
-		if obj.Size() > maxBlobSize {
+		if obj.Size() > *maxBlobSize {
 			skip(oid)
 			continue
 		}
@@ -394,7 +421,7 @@ func (c *catFile) read(oid string) (typ string, size int, data []byte, err error
 	if err != nil {
 		return
 	}
-	if size <= maxBlobSize {
+	if int64(size) <= *maxBlobSize {
 		data = make([]byte, size)
 		if _, err = io.ReadFull(c.out, data); err != nil {
 			return
@@ -421,7 +448,7 @@ func logCmd(repo string) error {
 	if err != nil {
 		return err
 	}
-	idx := &index{blobs: make(map[string]blobResult, 1<<16)}
+	idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
 	if _, err := scanBlobs(ctx, repo, m, idx); err != nil {
 		return err
 	}
@@ -433,14 +460,21 @@ func logCmd(repo string) error {
 	cmd := exec.Command("git", "-C", repo, "log", "--all", "--date-order",
 		"--no-abbrev", "--raw", "--no-renames",
 		"--format=%x00%H%x00%aI%x00%s")
-	out, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
 		return gitErr("log --raw", err)
 	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	var commit, date, subject string
 	printed := false
-	for _, line := range strings.Split(string(out), "\n") {
+	for scanner.Scan() {
+		line := scanner.Text()
 		if strings.HasPrefix(line, "\x00") {
 			f := strings.SplitN(line[1:], "\x00", 3)
 			commit, date, subject = f[0], f[1], f[2]
@@ -471,7 +505,10 @@ func logCmd(repo string) error {
 			fmt.Printf("    + %s\n", strings.Join(after, ", "))
 		}
 	}
-	return nil
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("git log --raw: %w", err)
+	}
+	return cmd.Wait()
 }
 
 func parseRaw(line string) (oldOID, newOID, path string, ok bool) {

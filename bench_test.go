@@ -50,7 +50,7 @@ func BenchmarkScanHistory(b *testing.B) {
 				var stats scanStats
 				b.ResetTimer()
 				for b.Loop() {
-					idx := &index{blobs: make(map[string]blobResult, 1<<16)}
+					idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
 					stats, err = scanBlobsWith(context.Background(), root, m, idx, feed)
 					if err != nil {
 						b.Fatal(err)

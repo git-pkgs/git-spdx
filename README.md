@@ -26,6 +26,7 @@ M1 Pro, 8 cores, 16 GB, go1.26.7.
 | rust-lang/cargo | 23,052 | 57,529 | 6.1 s | 306 MB | - |
 | rubygems/rubygems | 48,222 | 91,478 | 4.4 s | 476 MB | 8.1 s |
 | homebrew-core | 828,252 | 708,799 | 17.6 s | 1.30 GB | 187 s |
+| kubernetes/kubernetes | 161,360 | 578,039 | 48.4 s | 1.11 GB | 58.3 s |
 
 rubygems `log` reports 291 commits with license transitions back to 2004,
 including LICENSE.txt moving GPL-1.0-or-later to BSD-2-Clause to MIT.
