@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 
@@ -10,7 +9,7 @@ import (
 	kpzlib "github.com/klauspost/compress/zlib"
 )
 
-var goGitKlauspostZlib = flag.Bool("gogit-klauspost-zlib", false, "use klauspost zlib for go-git object decompression")
+var goGitKlauspostZlib = newOption(false)
 
 func configureGoGitZlib() error {
 	if !*goGitKlauspostZlib {

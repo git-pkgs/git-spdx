@@ -7,7 +7,6 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +22,8 @@ import (
 
 	"github.com/git-pkgs/licenses"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/cache"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -35,7 +36,6 @@ const (
 	jobQueueSize              = 256
 	jobBatchSize              = 64
 	jobBatchBytes             = 8 << 20
-	usageExitCode             = 2
 	catHeaderFields           = 3
 	expressionDisplayLimit    = 20
 	zeroOID                   = "0000000000000000000000000000000000000000"
@@ -43,71 +43,124 @@ const (
 )
 
 var (
-	cpuProfile    = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
-	memProfile    = flag.String("memprofile", "", "write heap profile after the blob scan to file")
-	backend       = flag.String("backend", "git", "backend: git (subprocesses) or gogit (Git-free)")
-	maxBlobSize   = flag.Int64("max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
-	readers       = flag.Int("readers", 0, "blob readers (0 = GOMAXPROCS for git, 1 for gogit)")
-	legalBlobSize = flag.Int64("max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
-	details       = flag.Bool("details", false, "print individual history changes")
-	group         = flag.String("group", groupAll, "history group: all, root, legal, other")
-	monthly       = flag.Bool("monthly", false, "write monthly history counts as CSV")
+	cpuProfile    = newOption("")
+	memProfile    = newOption("")
+	backend       = newOption("git")
+	maxBlobSize   = newOption(int64(defaultMaxBlobSize))
+	readers       = newOption(0)
+	legalBlobSize = newOption(int64(defaultLegalBlobSize))
+	details       = newOption(false)
+	group         = newOption(groupAll)
+	monthly       = newOption(false)
 )
 
 func main() {
-	flag.Usage = usage
-	flag.Parse()
-	if err := configureGoGitZlib(); err != nil {
-		fatal(err)
+	if err := newRootCommand().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "git-spdx:", err)
+		os.Exit(1)
 	}
-	args := flag.Args()
+}
+
+func newOption[T any](value T) *T {
+	return &value
+}
+
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:               "git-spdx",
+		Short:             "Find license changes across Git history",
+		SilenceErrors:     true,
+		SilenceUsage:      true,
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+	}
+	scanCommand := &cobra.Command{
+		Use:   "scan [repo]",
+		Short: "Match every blob and summarize detected licenses",
+		Args:  cobra.MaximumNArgs(1),
+		PreRunE: func(*cobra.Command, []string) error {
+			return validateOptions(false)
+		},
+		RunE: func(_ *cobra.Command, args []string) error {
+			return scan(repositoryArgument(args))
+		},
+	}
+	addScanFlags(scanCommand)
+
+	logCommand := &cobra.Command{
+		Use:   "log [repo]",
+		Short: "Summarize detected license changes by path group",
+		Args:  cobra.MaximumNArgs(1),
+		PreRunE: func(*cobra.Command, []string) error {
+			return validateOptions(true)
+		},
+		RunE: func(_ *cobra.Command, args []string) error {
+			return logCmd(repositoryArgument(args))
+		},
+	}
+	addLogFlags(logCommand)
+	root.AddCommand(scanCommand, logCommand)
+	return root
+}
+
+func addScanFlags(cmd *cobra.Command) {
+	addSharedFlags(cmd)
+	flags := cmd.Flags()
+	flags.StringVar(cpuProfile, "cpuprofile", "", "write CPU profile of the blob scan to file")
+	flags.StringVar(memProfile, "memprofile", "", "write heap profile after the blob scan to file")
+}
+
+func addLogFlags(cmd *cobra.Command) {
+	addSharedFlags(cmd)
+	flags := cmd.Flags()
+	flags.BoolVar(details, "details", false, "print individual history changes")
+	flags.StringVar(group, "group", groupAll, "history group: all, root, legal, other")
+	flags.BoolVar(monthly, "monthly", false, "write monthly history counts as CSV")
+}
+
+func addSharedFlags(cmd *cobra.Command) {
+	flags := cmd.Flags()
+	flags.StringVar(backend, "backend", "git", "backend: git (subprocesses) or gogit (Git-free)")
+	flags.Int64Var(maxBlobSize, "max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
+	flags.IntVar(readers, "readers", 0, "blob readers (0 = GOMAXPROCS for git, 1 for gogit)")
+	flags.Int64Var(legalBlobSize, "max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
+	flags.BoolVar(goGitMemoryIndex, "gogit-memory-index", false, "load pack indexes into memory")
+	flags.BoolVar(goGitMmap, "gogit-mmap", false, "memory-map read-only pack and index files")
+	flags.Uint64Var(goGitCacheBytes, "gogit-cache-bytes", uint64(cache.DefaultMaxSize), "go-git object cache capacity in bytes")
+	flags.IntVar(goGitCacheShards, "gogit-cache-shards", 1, "go-git object cache shards")
+	flags.BoolVar(goGitObjectInfos, "gogit-object-infos", true, "enumerate go-git object metadata before loading blobs")
+	flags.IntVar(goGitObjectBuffer, "gogit-object-buffer", defaultGoGitObjectBuffer, "buffered go-git object metadata entries")
+	flags.IntVar(goGitObjectBatch, "gogit-object-batch", defaultGoGitObjectBatch, "adjacent go-git object metadata entries per reader task")
+	flags.BoolVar(goGitKlauspostZlib, "gogit-klauspost-zlib", false, "use klauspost zlib for go-git object decompression")
+	flags.IntVar(historyWorkers, "history-workers", 1, "go-git history workers")
+}
+
+func validateOptions(history bool) error {
+	if *backend != "git" && *backend != goGitBackend {
+		return fmt.Errorf("unknown backend %q", *backend)
+	}
 	if *maxBlobSize < 0 || *legalBlobSize < 0 {
-		fatal(fmt.Errorf("blob size limits must be non-negative"))
+		return fmt.Errorf("blob size limits must be non-negative")
 	}
 	if *goGitObjectBuffer < 0 {
-		fatal(fmt.Errorf("go-git object buffer must be non-negative"))
+		return fmt.Errorf("go-git object buffer must be non-negative")
 	}
 	if *goGitObjectBatch <= 0 {
-		fatal(fmt.Errorf("go-git object batch must be positive"))
+		return fmt.Errorf("go-git object batch must be positive")
 	}
-	if !slices.Contains([]string{groupAll, groupRoot, groupLegal, groupOther}, *group) {
-		fatal(fmt.Errorf("unknown history group %q", *group))
+	if history && !slices.Contains([]string{groupAll, groupRoot, groupLegal, groupOther}, *group) {
+		return fmt.Errorf("unknown history group %q", *group)
 	}
-	if *monthly && *details {
-		fatal(fmt.Errorf("-monthly and -details cannot be combined"))
+	if history && *monthly && *details {
+		return fmt.Errorf("--monthly and --details cannot be combined")
 	}
-	if len(args) == 0 {
-		usage()
-		os.Exit(usageExitCode)
-	}
-	cmd, rest := args[0], args[1:]
-	repo := "."
-	if len(rest) > 0 {
-		repo = rest[0]
-	}
-	switch cmd {
-	case "scan":
-		if err := scan(repo); err != nil {
-			fatal(err)
-		}
-	case "log":
-		if err := logCmd(repo); err != nil {
-			fatal(err)
-		}
-	default:
-		usage()
-		os.Exit(usageExitCode)
-	}
+	return configureGoGitZlib()
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: git spdx [options] <scan|log> [repo]")
-	flag.PrintDefaults()
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "git-spdx:", err)
-	os.Exit(1)
+func repositoryArgument(args []string) string {
+	if len(args) == 1 {
+		return args[0]
+	}
+	return "."
 }
 
 type blobResult struct {

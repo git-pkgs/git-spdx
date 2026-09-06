@@ -15,7 +15,7 @@ const (
 	testSHA1     = "sha1"
 	testSHA256   = "sha256"
 	testApache   = "Apache-2.0"
-	testMmapFlag = "-gogit-mmap"
+	testMmapFlag = "--gogit-mmap"
 )
 
 func TestGitFreeParallelHistory(t *testing.T) {
@@ -31,10 +31,11 @@ func TestGitFreeParallelHistory(t *testing.T) {
 			}
 			git(t, repo, "gc", "--quiet")
 			for _, workers := range []string{"2", "4"} {
-				args := []string{"-history-workers=" + workers, testMmapFlag, "-readers=4"}
-				for _, mode := range []string{"-details", "-monthly"} {
-					got := cliWithoutGit(t, append(args, mode, "log", repo)...)
-					want := cli(t, mode, "log", repo)
+				args := []string{"--history-workers=" + workers, testMmapFlag, "--readers=4"}
+				for _, mode := range []string{"--details", "--monthly"} {
+					commandArgs := append([]string{"log", repo}, args...)
+					got := cliWithoutGit(t, append(commandArgs, mode)...)
+					want := cli(t, "log", repo, mode)
 					if got != want {
 						t.Fatalf("history differs:\n%s\n%s", got, want)
 					}
@@ -60,7 +61,7 @@ func TestGitFreeParallelHistoryMissingTree(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, os.Args[0], "-backend=gogit", "-history-workers=4", "scan", repo)
+	cmd = exec.CommandContext(ctx, os.Args[0], "scan", repo, "--backend=gogit", "--history-workers=4")
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "PATH="+t.TempDir())
 	out, err = cmd.CombinedOutput()
 	if ctx.Err() != nil {

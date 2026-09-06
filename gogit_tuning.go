@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -16,14 +15,19 @@ import (
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 )
 
+const (
+	defaultGoGitObjectBuffer = 64
+	defaultGoGitObjectBatch  = 64
+)
+
 var (
-	goGitMemoryIndex  = flag.Bool("gogit-memory-index", false, "load pack indexes into memory")
-	goGitMmap         = flag.Bool("gogit-mmap", false, "memory-map read-only pack and index files")
-	goGitCacheBytes   = flag.Uint64("gogit-cache-bytes", uint64(cache.DefaultMaxSize), "go-git object cache capacity in bytes")
-	goGitCacheShards  = flag.Int("gogit-cache-shards", 1, "go-git object cache shards")
-	goGitObjectInfos  = flag.Bool("gogit-object-infos", true, "enumerate go-git object metadata before loading blobs")
-	goGitObjectBuffer = flag.Int("gogit-object-buffer", 64, "buffered go-git object metadata entries")
-	goGitObjectBatch  = flag.Int("gogit-object-batch", 64, "adjacent go-git object metadata entries per reader task")
+	goGitMemoryIndex  = newOption(false)
+	goGitMmap         = newOption(false)
+	goGitCacheBytes   = newOption(uint64(cache.DefaultMaxSize))
+	goGitCacheShards  = newOption(1)
+	goGitObjectInfos  = newOption(true)
+	goGitObjectBuffer = newOption(defaultGoGitObjectBuffer)
+	goGitObjectBatch  = newOption(defaultGoGitObjectBatch)
 )
 
 type goGitObjectTask struct {

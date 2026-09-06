@@ -1,8 +1,6 @@
 package main
 
-import "flag"
-
-var historyWorkers = flag.Int("history-workers", 1, "go-git history workers")
+var historyWorkers = newOption(1)
 
 const historyLookahead = 2
 

@@ -46,13 +46,13 @@ func TestCLILegalBlobCaps(t *testing.T) {
 	commitFile(t, repo, "generated.txt", content+"extra\n", "Add unrelated large blob")
 	for _, backend := range []string{"git", "gogit"} {
 		t.Run(backend, func(t *testing.T) {
-			out := cli(t, "-backend", backend, "scan", repo)
+			out := cli(t, "scan", repo, "--backend", backend)
 			if metric(t, out, "blobs with hits") != 1 || metric(t, out, "skipped: size") != 1 {
 				t.Fatalf("legal alias must lift only its own blob cap:\n%s", out)
 			}
 		})
 	}
-	out := cli(t, "-max-legal-blob-size", "1048576", "scan", repo)
+	out := cli(t, "scan", repo, "--max-legal-blob-size", "1048576")
 	if metric(t, out, "skipped: size") != 2 {
 		t.Fatalf("explicit legal cap must apply:\n%s", out)
 	}
@@ -92,7 +92,7 @@ func TestCLIIncompleteComparison(t *testing.T) {
 			repo := repository(t)
 			commitFile(t, repo, "source.go", "// SPDX-License-Identifier: MIT\n", "Add license")
 			commitFile(t, repo, "source.go", content, "Unscannable file")
-			out := cli(t, "-max-blob-size", "1000", "-details", "log", repo)
+			out := cli(t, "log", repo, "--max-blob-size", "1000", "--details")
 			if !strings.Contains(out, "1 incomplete comparisons") || !strings.Contains(out, "0 expression changes") || strings.Contains(out, "    - MIT") {
 				t.Fatalf("skipped result must not imply removal:\n%s", out)
 			}
@@ -111,7 +111,7 @@ func TestCLIHistoryGroupsAndPaths(t *testing.T) {
 			t.Fatalf("missing %q:\n%s", want, out)
 		}
 	}
-	out = cli(t, "-group", "legal", "-details", "log", repo)
+	out = cli(t, "log", repo, "--group", "legal", "--details")
 	if !strings.Contains(out, `"LICENSES/odd\n\t雪.txt"`) || strings.Contains(out, "[other]") || strings.Contains(out, "root:") {
 		t.Fatalf("filter or NUL-delimited path handling failed:\n%s", out)
 	}
@@ -182,7 +182,7 @@ func TestCLISPDXDeclarationWithoutExpressionChange(t *testing.T) {
 	commitFile(t, repo, "source.c", mitNotice, "Add notice")
 	commitFile(t, repo, "source.c", mitNotice+mitNotice, "Repeat notice")
 	commitFile(t, repo, "source.c", "// SPDX-License-Identifier: MIT\n"+mitNotice, "Add explicit declaration")
-	out := cli(t, "-details", "log", repo)
+	out := cli(t, "log", repo, "--details")
 	if strings.Contains(out, "Repeat notice") || !strings.Contains(out, "Add explicit declaration") || !strings.Contains(out, "0 expression changes") || !strings.Contains(out, "1 SPDX declarations added") {
 		t.Fatalf("declarations and repeated notices must be separate from expression changes:\n%s", out)
 	}
@@ -193,7 +193,7 @@ func TestCLICorpusCoveredSPDXDeclaration(t *testing.T) {
 	source := "int example(void) { return 0; }\n"
 	commitFile(t, repo, "source.c", source, "Add source")
 	commitFile(t, repo, "source.c", "// SPDX-License-Identifier: GPL-2.0\n"+source, "Add GPL declaration")
-	out := cli(t, "-details", "log", repo)
+	out := cli(t, "log", repo, "--details")
 	if !strings.Contains(out, "1 SPDX declarations added") || !strings.Contains(out, "SPDX declaration: false -> true") {
 		t.Fatalf("a corpus-covered tag must count as a declaration:\n%s", out)
 	}
@@ -215,7 +215,7 @@ func TestCLIMonthlyCounts(t *testing.T) {
 	repo := repository(t)
 	commitFile(t, repo, "source.c", mitNotice, "Add notice")
 	commitFile(t, repo, "source.c", "// SPDX-License-Identifier: MIT\n"+mitNotice, "Add declaration")
-	out := cli(t, "-monthly", "log", repo)
+	out := cli(t, "log", repo, "--monthly")
 	if !strings.HasPrefix(out, "month,group,commits,expression_changes,file_additions,file_deletions,incomplete,spdx_added,spdx_removed\n") || !strings.Contains(out, ",other,2,0,1,0,0,1,0\n") {
 		t.Fatalf("monthly CSV must distinguish declaration additions:\n%s", out)
 	}
@@ -257,11 +257,28 @@ func TestCLIEmptyRepository(t *testing.T) {
 }
 
 func TestCLIHelp(t *testing.T) {
-	out := cli(t, "-h")
+	out := cli(t, "log", "--help")
 	for _, option := range []string{"-max-legal-blob-size", "-group", "-monthly"} {
 		if !strings.Contains(out, option) {
 			t.Fatalf("help is missing %s:\n%s", option, out)
 		}
+	}
+	if strings.Contains(out, "--cpuprofile") {
+		t.Fatalf("log help includes scan-only flags:\n%s", out)
+	}
+	scanHelp := cli(t, "scan", "--help")
+	if !strings.Contains(scanHelp, "--cpuprofile") || strings.Contains(scanHelp, "--monthly") {
+		t.Fatalf("scan help has the wrong flags:\n%s", scanHelp)
+	}
+}
+
+func TestCLIFlagsMaySurroundRepository(t *testing.T) {
+	repo := repository(t)
+	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
+	before := cli(t, "log", "--details", repo)
+	after := cli(t, "log", repo, "--details")
+	if before != after {
+		t.Fatalf("flag placement changed output:\nbefore repository:\n%s\nafter repository:\n%s", before, after)
 	}
 }
 
@@ -312,7 +329,7 @@ func TestCLILegalPathIntroducedByMerge(t *testing.T) {
 	commitFile(t, repo, "Godeps/LICENSES", content, "Add legal path during merge")
 	git(t, repo, "rm", "Godeps/LICENSES")
 	git(t, repo, "commit", "-m", "Remove legal path")
-	out := cli(t, "-max-blob-size", "64", "-max-legal-blob-size", "1024", "scan", repo)
+	out := cli(t, "scan", repo, "--max-blob-size", "64", "--max-legal-blob-size", "1024")
 	if metric(t, out, "blobs with hits") != 1 || metric(t, out, "skipped: size") != 0 {
 		t.Fatalf("a merge-only legal path must contribute to blob eligibility:\n%s", out)
 	}
@@ -326,7 +343,7 @@ func TestCLIMatcherErrorRemainsIncomplete(t *testing.T) {
 	if metric(t, out, "skipped: error") != 1 {
 		t.Fatalf("matcher errors must be counted:\n%s", out)
 	}
-	out = cli(t, "-details", "log", repo)
+	out = cli(t, "log", repo, "--details")
 	if !strings.Contains(out, "before=scanned, after=error") || !strings.Contains(out, "1 incomplete comparisons") || strings.Contains(out, "    - MIT") {
 		t.Fatalf("matcher errors must not imply license removal:\n%s", out)
 	}
@@ -382,7 +399,11 @@ func TestCLI(t *testing.T) {
 	commitFile(t, repo, "source.go", "// SPDX-License-Identifier: Apache-2.0\npackage example\n", "Change expression")
 	for _, command := range []string{"scan", "log"} {
 		t.Run(command, func(t *testing.T) {
-			out := cli(t, "-readers", "2", "-details", command, repo)
+			args := []string{command, repo, "--readers", "2"}
+			if command == "log" {
+				args = append(args, "--details")
+			}
+			out := cli(t, args...)
 			for _, expression := range []string{mitExpression, "Apache-2.0"} {
 				if !strings.Contains(out, expression) {
 					t.Fatalf("missing %s:\n%s", expression, out)
@@ -395,7 +416,7 @@ func TestCLI(t *testing.T) {
 func TestCLIBenchmarkPhases(t *testing.T) {
 	repo := repository(t)
 	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
-	cmd := exec.Command(os.Args[0], "-backend=gogit", "scan", repo)
+	cmd := exec.Command(os.Args[0], "scan", repo, "--backend=gogit")
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GITSPDX_BENCH_PHASES=1", "GOMAXPROCS=2")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

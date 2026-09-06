@@ -15,7 +15,9 @@ import (
 
 func cliWithoutGit(t *testing.T, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], append([]string{"-backend=gogit", "-history-workers=4"}, args...)...)
+	commandArgs := append([]string{}, args...)
+	commandArgs = append(commandArgs, "--backend=gogit", "--history-workers=4")
+	cmd := exec.Command(os.Args[0], commandArgs...)
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -72,8 +74,8 @@ func TestGitFreePackedHistory(t *testing.T) {
 			commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Change license")
 			commitFile(t, repo, "LICENSES/odd\n雪.txt", "SPDX-License-Identifier: MIT\n", "Add vendor notice")
 			git(t, repo, "gc", "--quiet")
-			want := cli(t, "-details", "log", repo)
-			got := cliWithoutGit(t, "-details", "log", repo)
+			want := cli(t, "log", repo, "--details")
+			got := cliWithoutGit(t, "log", repo, "--details")
 			if got != want {
 				t.Fatalf("history differs:\nwant:\n%s\ngot:\n%s", want, got)
 			}
@@ -102,12 +104,12 @@ func TestGitFreeMergeLegalPathAndTag(t *testing.T) {
 	git(t, repo, "tag", "-a", "tag-only", "-m", "Tagged orphan")
 	git(t, repo, "switch", "main")
 	git(t, repo, "branch", "-D", "tagged")
-	args := []string{"-max-blob-size=64", "-max-legal-blob-size=1024"}
-	out := cliWithoutGit(t, append(args, "scan", repo)...)
+	args := []string{"scan", repo, "--max-blob-size=64", "--max-legal-blob-size=1024"}
+	out := cliWithoutGit(t, args...)
 	if metric(t, out, "blobs with hits") != 2 || metric(t, out, "skipped: size") != 0 {
 		t.Fatal(out)
 	}
-	args = append(args, "-monthly", "log", repo)
+	args = []string{"log", repo, "--max-blob-size=64", "--max-legal-blob-size=1024", "--monthly"}
 	if got, want := cliWithoutGit(t, args...), cli(t, args...); got != want {
 		t.Fatalf("monthly counts differ:\n%s\n%s", got, want)
 	}
@@ -124,8 +126,8 @@ func TestGitFreeBareWorktreeAndShallow(t *testing.T) {
 	shallow := filepath.Join(t.TempDir(), "shallow")
 	git(t, repo, "clone", "--depth=1", "file://"+repo, shallow)
 	for _, path := range []string{bare, worktree, shallow} {
-		want := cli(t, "-details", "log", path)
-		got := cliWithoutGit(t, "-details", "log", path)
+		want := cli(t, "log", path, "--details")
+		got := cliWithoutGit(t, "log", path, "--details")
 		if got != want {
 			t.Fatalf("history for %s differs:\nwant:\n%s\ngot:\n%s", path, want, got)
 		}
@@ -147,7 +149,7 @@ func TestGitFreeRejectsAlternateObjectStore(t *testing.T) {
 	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
 	shared := filepath.Join(t.TempDir(), "shared")
 	git(t, repo, "clone", "--shared", repo, shared)
-	cmd := exec.Command(os.Args[0], "-backend=gogit", "scan", shared)
+	cmd := exec.Command(os.Args[0], "scan", shared, "--backend=gogit")
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "does not support objects/info/alternates") {
@@ -163,7 +165,7 @@ func TestGitFreeHistoryWithClockSkew(t *testing.T) {
 		content := []string{"MIT", "Apache-2.0", "BSD-3-Clause"}[i]
 		commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: "+content+"\n", "License "+content)
 	}
-	if got, want := cliWithoutGit(t, "-details", "log", repo), cli(t, "-details", "log", repo); got != want {
+	if got, want := cliWithoutGit(t, "log", repo, "--details"), cli(t, "log", repo, "--details"); got != want {
 		t.Fatalf("clock-skewed history differs:\n%s\n%s", got, want)
 	}
 }
@@ -196,7 +198,7 @@ func TestGitFreeScanRejectsCorruptBlobChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, klauspost := range []bool{false, true} {
-		cmd = exec.Command(os.Args[0], "-backend=gogit", "-readers=4", "-gogit-memory-index", fmt.Sprintf("-gogit-klauspost-zlib=%t", klauspost), "scan", repo)
+		cmd = exec.Command(os.Args[0], "scan", repo, "--backend=gogit", "--readers=4", "--gogit-memory-index", fmt.Sprintf("--gogit-klauspost-zlib=%t", klauspost))
 		cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
 		out, err := cmd.CombinedOutput()
 		if err == nil || !strings.Contains(string(out), "checksum") {

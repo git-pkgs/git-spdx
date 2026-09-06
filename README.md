@@ -27,25 +27,25 @@ file views.
 ```bash
 git spdx scan [repo]   # match every blob, print throughput and expression histogram
 git spdx log  [repo]   # summarise detected changes by path group
-git spdx -details log [repo]  # include individual commits and paths
-git spdx -group legal -details log [repo]
-git spdx -monthly log [repo] > monthly.csv
-git spdx -backend=gogit scan [repo]  # run without Git subprocesses
+git spdx log [repo] --details  # include individual commits and paths
+git spdx log [repo] --group legal --details
+git spdx log [repo] --monthly > monthly.csv
+git spdx scan [repo] --backend=gogit  # run without Git subprocesses
 ```
 
 Drop the `git-spdx` binary on `$PATH` to use it as a git subcommand.
-Options go before the command.
+Options follow the command and may appear before or after the repository path.
 
 `log` groups paths as `root` (root legal files), `legal` (legal files in
 subdirectories), and `other`. Legal filenames and directories use
 `licenses.LegalFileRoles`; a subdirectory does not establish that a file
-is vendored. Use `-group root`, `-group legal`, or `-group other` to filter
+is vendored. Use `--group root`, `--group legal`, or `--group other` to filter
 the report.
 
 ## Example
 
 Kubernetes picked up go-yaml's LGPL-to-Apache license change on 2018-01-16,
-18 months after the upstream change. `git spdx -details -group legal log`
+18 months after the upstream change. `git spdx log --details --group legal`
 reported the vendored transition:
 
 ```text
@@ -64,7 +64,7 @@ Skipped blobs produce incomplete comparisons, never inferred license
 additions or removals. Repeated notices with the same expression do not
 produce expression changes.
 
-`-monthly` writes CSV grouped by author month and path group. Commit counts
+`--monthly` writes CSV grouped by author month and path group. Commit counts
 include reported changes and incomplete comparisons. They are distinct
 within each group; a commit touching several groups appears in each.
 The SPDX columns count files gaining or losing their first/last
@@ -73,14 +73,14 @@ parsed declaration, including file additions and deletions.
 The default text limit is 1 MiB, raised to 8 MiB for any blob that appears
 at a legal path in reachable history. Every historical path occurrence
 contributes to eligibility, including deleted legal files and shared blobs.
-Set `-max-blob-size` and `-max-legal-blob-size` in bytes to change these
+Set `--max-blob-size` and `--max-legal-blob-size` in bytes to change these
 limits; legal blobs use the larger value. A zero limit permits only empty
 blobs. Size, binary, and matcher-error skips are reported separately.
 
 ## Backends
 
 Native Git remains the default. It uses parallel `git cat-file` processes and
-accepts `-readers=0` as `GOMAXPROCS`. Peak memory comparisons should include
+accepts `--readers=0` as `GOMAXPROCS`. Peak memory comparisons should include
 the `git-spdx` process and all of its child processes.
 
 The Git-free backend supports pack index mmap, parallel object readers,
@@ -88,9 +88,9 @@ parallel history work, a sharded object cache, and klauspost zlib. The settings
 used for the Cargo benchmark below were:
 
 ```bash
-git spdx -backend=gogit -gogit-mmap -gogit-klauspost-zlib \
-  -readers=8 -history-workers=6 \
-  -gogit-cache-bytes=100663296 -gogit-cache-shards=8 scan [repo]
+git spdx scan [repo] --backend=gogit --gogit-mmap --gogit-klauspost-zlib \
+  --readers=8 --history-workers=6 \
+  --gogit-cache-bytes=100663296 --gogit-cache-shards=8
 ```
 
 Repositories using replacement refs, grafts, object-directory environment
@@ -126,7 +126,7 @@ metrics: blobs/op, hits/op, MB/op, µs/blob, heap_MiB, plus the standard
 ns/op, B/op, allocs/op. The matcher is loaded once and shared across all
 subtests; `BenchmarkMatcherLoad` measures that separately.
 
-Add `-cpuprofile` and `-memprofile` to the built binary's `scan` command
+Add `--cpuprofile` and `--memprofile` to the built binary's `scan` command
 for profiling a single run.
 
 ## Limitations
