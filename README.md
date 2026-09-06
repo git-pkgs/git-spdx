@@ -1,18 +1,26 @@
 # git-spdx
 
-Scan every blob in a Git repository's object store and report where detected
-SPDX expressions changed across the commit graph. Detections are cached by
-blob object ID, so each unique piece of content is matched once regardless of
-how many commits or paths reference it.
+Find when detected licenses and SPDX declarations changed across a Git
+repository's entire history. git-spdx matches each unique blob once and
+replays commit history against the cached results, avoiding a full scan of
+every revision.
 
 The default backend uses native Git subprocesses. The `gogit` backend reads
 the repository and its history in Go, so the binary can run on a machine
-without Git installed. Both backends use `github.com/git-pkgs/licenses` for
-license detection.
+without Git installed. License detection comes from
+[git-pkgs/licenses](https://github.com/git-pkgs/licenses).
 
 ```bash
 go build -o git-spdx .
 ```
+
+The module pins public fork patches through `replace` directives, so
+`go install github.com/git-pkgs/git-spdx@latest` refuses to install it.
+Clone the repository and run the build command above until those changes land
+upstream. [git-pkgs/go-git](https://github.com/git-pkgs/go-git) carries the
+correctness and packed-object reader changes prepared for upstream review;
+[git-pkgs/go-billy](https://github.com/git-pkgs/go-billy) supplies its mmap
+file views.
 
 ## Commands
 
@@ -33,6 +41,19 @@ subdirectories), and `other`. Legal filenames and directories use
 `licenses.LegalFileRoles`; a subdirectory does not establish that a file
 is vendored. Use `-group root`, `-group legal`, or `-group other` to filter
 the report.
+
+## Example
+
+Kubernetes picked up go-yaml's LGPL-to-Apache license change on 2018-01-16,
+18 months after the upstream change. `git spdx -details -group legal log`
+reported the vendored transition:
+
+```text
+713b1fc396a1  2018-01-16  bump(gopkg.in/yaml.v2): 670d4cf...
+  [legal] "vendor/gopkg.in/yaml.v2/LICENSE" (expressions changed)
+    - LGPL-3.0-or-later WITH LGPL-3.0-linking-exception
+    + Apache-2.0
+```
 
 The report counts file additions and deletions separately from expression
 changes in existing files. It also counts files gaining or losing a parsed
@@ -78,16 +99,20 @@ backend. This prevents partial history scans.
 
 ## Numbers
 
-Two-run averages on an M1 Pro with 8 cores and 16 GB, scanning
-`rust-lang/cargo` at `a07c49a989d565727725e5bb5a8038ff402006a8`:
+Two-run averages on an M1 Pro with 8 cores and 16 GB, scanning a full clone of
+`rust-lang/cargo` with 23,190 commits dated 2014-03-04 through 2026-09-05 and
+189,074 packed objects:
 
 | backend | wall | CPU | peak process-tree RSS |
 |---|---:|---:|---:|
-| native Git | 4.07 s | 20.17 s | 2.10 GiB |
-| Git-free | 3.55 s | 20.33 s | 606 MiB |
+| native Git | 4.05 s | 20.03 s | 2.12 GiB |
+| Git-free | 3.57 s | 20.14 s | 614 MiB |
 
-Both backends reported 57,969 blobs seen, 57,967 matched, 5,761 with license
+Both backends reported 58,000 blobs seen, 57,998 matched, 5,765 with license
 hits, two size skips, and 33 binary skips. Their normalized output was equal.
+The checked-out Cargo tree at `a07c49a` has 2,950 files and takes 0.65 s to
+scan with `licenses` using its default flags. The git-spdx timing covers the
+1.3 GB of blobs stored across the repository rather than only that tree.
 
 ## Benchmarks
 
@@ -112,6 +137,10 @@ for profiling a single run.
   again. Changes made only while resolving a merge are therefore omitted.
   Legal-path discovery includes merge diffs against the first parent.
 - Binary blobs (containing NUL) are skipped.
+- Symlink blobs are scanned as text, so a target path that resembles license
+  text can produce a match.
 - `scan` includes unreachable objects in the object store. Legal-path
   eligibility and `log` cover history reachable from refs.
+- Legal-path caps follow `licenses.LegalFileRoles`. Names such as
+  `license.rs` are included; `THIRD_PARTY_LICENSES.txt` and `PATENTS` are not.
 - No `blame` or `diff A..B` subcommands yet.
