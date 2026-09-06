@@ -50,7 +50,7 @@ func BenchmarkScanHistory(b *testing.B) {
 				var stats scanStats
 				b.ResetTimer()
 				for b.Loop() {
-					idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
+					idx := newIndex()
 					stats, err = scanBlobsWith(context.Background(), root, m, idx, feed)
 					if err != nil {
 						b.Fatal(err)
@@ -78,5 +78,53 @@ func BenchmarkMatcherLoad(b *testing.B) {
 		if _, err := licenses.New(); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkFeedBlobs(b *testing.B) {
+	for _, root := range benchmarkRepositoryRoots(b) {
+		for name, feed := range backends {
+			b.Run(filepath.Base(root)+"/"+name, func(b *testing.B) {
+				var total int
+				var bytes int64
+				b.ReportAllocs()
+				for b.Loop() {
+					jobs := make(chan job, jobQueueSize)
+					done := make(chan int64, 1)
+					go func() {
+						var n int64
+						for j := range jobs {
+							n += int64(len(j.data))
+						}
+						done <- n
+					}()
+					var err error
+					total, err = feed(root, jobs, func(string) {}, func(string) int64 { return 1 << 20 })
+					close(jobs)
+					bytes = <-done
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.SetBytes(bytes)
+				b.ReportMetric(float64(total), "blobs/op")
+			})
+		}
+	}
+}
+
+func BenchmarkWalkChanges(b *testing.B) {
+	for _, root := range benchmarkRepositoryRoots(b) {
+		b.Run(filepath.Base(root), func(b *testing.B) {
+			var count int
+			b.ReportAllocs()
+			for b.Loop() {
+				count = 0
+				if err := walkChanges(root, true, func(change) { count++ }); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(count), "changes/op")
+		})
 	}
 }

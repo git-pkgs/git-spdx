@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"os/exec"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,26 +27,47 @@ import (
 )
 
 const (
-	defaultMaxBlobSize = 1 << 20
-	zeroOID            = "0000000000000000000000000000000000000000"
-	zeroOIDSHA256      = "0000000000000000000000000000000000000000000000000000000000000000"
+	defaultMaxBlobSize        = 1 << 20
+	defaultLegalBlobSize      = 8 << 20
+	initialBlobCapacity       = 1 << 16
+	initialExpressionCapacity = 128
+	readerBufferSize          = 1 << 16
+	jobQueueSize              = 256
+	usageExitCode             = 2
+	catHeaderFields           = 3
+	expressionDisplayLimit    = 20
+	zeroOID                   = "0000000000000000000000000000000000000000"
+	zeroOIDSHA256             = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 var (
-	cpuProfile  = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
-	memProfile  = flag.String("memprofile", "", "write heap profile after the blob scan to file")
-	backend     = flag.String("backend", "git", "object reader: git (cat-file) or gogit")
-	maxBlobSize = flag.Int64("max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
-	readers     = flag.Int("readers", 0, "cat-file reader processes (0 = GOMAXPROCS)")
+	cpuProfile    = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
+	memProfile    = flag.String("memprofile", "", "write heap profile after the blob scan to file")
+	backend       = flag.String("backend", "git", "object reader: git (cat-file) or gogit")
+	maxBlobSize   = flag.Int64("max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
+	readers       = flag.Int("readers", 0, "cat-file reader processes (0 = GOMAXPROCS)")
+	legalBlobSize = flag.Int64("max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
+	details       = flag.Bool("details", false, "print individual history changes")
+	group         = flag.String("group", groupAll, "history group: all, root, legal, other")
+	monthly       = flag.Bool("monthly", false, "write monthly history counts as CSV")
 )
 
 func main() {
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
+	if *maxBlobSize < 0 || *legalBlobSize < 0 {
+		fatal(fmt.Errorf("blob size limits must be non-negative"))
+	}
+	if !slices.Contains([]string{groupAll, groupRoot, groupLegal, groupOther}, *group) {
+		fatal(fmt.Errorf("unknown history group %q", *group))
+	}
+	if *monthly && *details {
+		fatal(fmt.Errorf("-monthly and -details cannot be combined"))
+	}
 	if len(args) == 0 {
 		usage()
-		os.Exit(2)
+		os.Exit(usageExitCode)
 	}
 	cmd, rest := args[0], args[1:]
 	repo := "."
@@ -60,12 +85,13 @@ func main() {
 		}
 	default:
 		usage()
-		os.Exit(2)
+		os.Exit(usageExitCode)
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: git spdx <scan|log> [repo]")
+	fmt.Fprintln(os.Stderr, "usage: git spdx [options] <scan|log> [repo]")
+	flag.PrintDefaults()
 }
 
 func fatal(err error) {
@@ -75,36 +101,82 @@ func fatal(err error) {
 
 type blobResult struct {
 	expressions []string
-	skipped     string
+	skipped     skipReason
+	spdx        bool
+}
+
+type skipReason uint8
+
+const (
+	notSkipped skipReason = iota
+	skippedSize
+	skippedBinary
+	skippedError
+)
+
+func (s skipReason) String() string {
+	switch s {
+	case skippedSize:
+		return "size"
+	case skippedBinary:
+		return "binary"
+	case skippedError:
+		return "error"
+	default:
+		return "scanned"
+	}
+}
+
+// Each index belongs to one repository with one object format.
+type objectID [sha256.Size]byte
+
+func parseOID(s string) (objectID, error) {
+	var oid objectID
+	if len(s) != hex.EncodedLen(sha1.Size) && len(s) != hex.EncodedLen(sha256.Size) {
+		return oid, fmt.Errorf("invalid object ID %q", s)
+	}
+	_, err := hex.Decode(oid[:], []byte(s))
+	return oid, err
 }
 
 type index struct {
 	mu       sync.RWMutex
-	blobs    map[string]blobResult
+	blobs    map[objectID]blobResult
 	interned map[string]string
 	skipped  int
+	err      error
+}
+
+func newIndex() *index {
+	return &index{blobs: make(map[objectID]blobResult, initialBlobCapacity), interned: make(map[string]string, initialExpressionCapacity)}
 }
 
 func (x *index) get(oid string) (blobResult, bool) {
+	key, err := parseOID(oid)
+	if err != nil {
+		return blobResult{skipped: skippedError}, true
+	}
 	x.mu.RLock()
-	r, ok := x.blobs[oid]
+	r, ok := x.blobs[key]
 	x.mu.RUnlock()
 	return r, ok
 }
 
-// put stores only blobs with detections; absence means scanned and empty.
-// Expression strings are interned so repeated values share storage.
+// Empty successful results are implicit after a completed scan.
 func (x *index) put(oid string, r blobResult) {
-	if r.skipped != "" {
-		x.mu.Lock()
-		x.skipped++
-		x.mu.Unlock()
-		return
-	}
-	if len(r.expressions) == 0 {
+	if len(r.expressions) == 0 && r.skipped == notSkipped && !r.spdx {
 		return
 	}
 	x.mu.Lock()
+	defer x.mu.Unlock()
+	key, err := parseOID(oid)
+	if err != nil {
+		x.err = err
+		return
+	}
+	if r.skipped != notSkipped {
+		x.skipped++
+	}
 	for i, e := range r.expressions {
 		if s, ok := x.interned[e]; ok {
 			r.expressions[i] = s
@@ -112,8 +184,7 @@ func (x *index) put(oid string, r blobResult) {
 			x.interned[e] = e
 		}
 	}
-	x.blobs[oid] = r
-	x.mu.Unlock()
+	x.blobs[key] = r
 }
 
 // scan matches every blob reachable from any ref and reports throughput.
@@ -137,11 +208,11 @@ func scan(repo string) error {
 		}
 		defer func() {
 			pprof.StopCPUProfile()
-			f.Close()
+			_ = f.Close()
 		}()
 	}
 
-	idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
+	idx := newIndex()
 	stats, err := scanBlobs(ctx, repo, m, idx)
 	if err != nil {
 		return err
@@ -156,7 +227,9 @@ func scan(repo string) error {
 		if err := pprof.WriteHeapProfile(f); err != nil {
 			return err
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			return err
+		}
 	}
 
 	fmt.Printf("matcher load        %8s\n", loadDur.Round(time.Millisecond))
@@ -167,6 +240,7 @@ func scan(repo string) error {
 	fmt.Printf("blobs with hits     %8d\n", stats.hits)
 	fmt.Printf("skipped: size       %8d\n", stats.skipSize)
 	fmt.Printf("skipped: binary     %8d\n", stats.skipBinary)
+	fmt.Printf("skipped: error      %8d\n", stats.skipError)
 	fmt.Printf("bytes matched       %8s\n", human(stats.bytes))
 	if stats.matched > 0 {
 		perBlob := stats.elapsed / time.Duration(stats.matched)
@@ -179,10 +253,10 @@ func scan(repo string) error {
 }
 
 type scanStats struct {
-	total, matched, hits int
-	skipSize, skipBinary int
-	bytes                int64
-	elapsed              time.Duration
+	total, matched, hits            int
+	skipSize, skipBinary, skipError int
+	bytes                           int64
+	elapsed                         time.Duration
 }
 
 type job struct {
@@ -197,8 +271,18 @@ func scanBlobs(ctx context.Context, repo string, m *licenses.Matcher, idx *index
 func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *index, feed feeder) (scanStats, error) {
 	var stats scanStats
 	t0 := time.Now()
+	legal, err := legalBlobs(repo)
+	if err != nil {
+		return stats, err
+	}
+	limit := func(oid string) int64 {
+		if legal[oid] {
+			return max(*maxBlobSize, *legalBlobSize)
+		}
+		return *maxBlobSize
+	}
 
-	jobs := make(chan job, 256)
+	jobs := make(chan job, jobQueueSize)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	workers := runtime.GOMAXPROCS(0)
@@ -215,8 +299,11 @@ func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *i
 				if len(r.expressions) > 0 {
 					stats.hits++
 				}
-				if r.skipped == "binary" {
+				if r.skipped == skippedBinary {
 					stats.skipBinary++
+				}
+				if r.skipped == skippedError {
+					stats.skipError++
 				}
 				if stats.matched%200_000 == 0 {
 					fmt.Fprintf(os.Stderr, "  %d blobs, %s, %s\n",
@@ -228,24 +315,26 @@ func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *i
 	}
 
 	skip := func(oid string) {
-		idx.put(oid, blobResult{skipped: "size"})
+		idx.put(oid, blobResult{skipped: skippedSize})
 		mu.Lock()
 		stats.skipSize++
 		mu.Unlock()
 	}
 
-	var err error
-	stats.total, err = feed(repo, jobs, skip)
+	stats.total, err = feed(repo, jobs, skip, limit)
 	close(jobs)
+	wg.Wait()
 	if err != nil {
 		return stats, err
 	}
-	wg.Wait()
+	if idx.err != nil {
+		return stats, idx.err
+	}
 	stats.elapsed = time.Since(t0)
 	return stats, nil
 }
 
-type feeder func(repo string, jobs chan<- job, skip func(string)) (int, error)
+type feeder func(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error)
 
 func feederFor(name string) feeder {
 	if name == "gogit" {
@@ -254,56 +343,67 @@ func feederFor(name string) feeder {
 	return feedBlobsCatFile
 }
 
-func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string)) (int, error) {
-	oids, err := listBlobs(repo)
-	if err != nil {
-		return 0, err
-	}
+func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	shards := *readers
 	if shards <= 0 {
 		shards = runtime.GOMAXPROCS(0)
 	}
-	shards = max(1, min(shards, len(oids)))
+	shards = max(1, shards)
+	oids := make(chan string, jobQueueSize)
 	var wg sync.WaitGroup
 	errs := make(chan error, shards)
 	for s := 0; s < shards; s++ {
 		wg.Add(1)
-		go func(s int) {
+		go func() {
 			defer wg.Done()
 			cat, err := newCatFile(repo)
 			if err != nil {
 				errs <- err
+				cancel()
 				return
 			}
 			defer cat.close()
-			for i := s; i < len(oids); i += shards {
-				typ, size, data, err := cat.read(oids[i])
+			for oid := range oids {
+				cap := limit(oid)
+				typ, size, data, err := cat.read(oid, cap)
 				if err != nil {
 					errs <- err
+					cancel()
 					return
 				}
 				if typ != "blob" {
 					continue
 				}
-				if int64(size) > *maxBlobSize {
-					skip(oids[i])
+				if int64(size) > cap {
+					skip(oid)
 					continue
 				}
-				jobs <- job{oid: oids[i], data: data}
+				jobs <- job{oid: oid, data: data}
 			}
-		}(s)
+		}()
 	}
+	total, err := listBlobs(ctx, repo, func(oid string) error {
+		select {
+		case oids <- oid:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	close(oids)
 	wg.Wait()
 	close(errs)
 	for e := range errs {
 		if e != nil {
-			return len(oids), e
+			return total, e
 		}
 	}
-	return len(oids), nil
+	return total, err
 }
 
-func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string)) (int, error) {
+func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
 	r, err := gogit.PlainOpen(repo)
 	if err != nil {
 		return 0, err
@@ -324,7 +424,7 @@ func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string)) (int, error
 		}
 		total++
 		oid := obj.Hash().String()
-		if obj.Size() > *maxBlobSize {
+		if obj.Size() > limit(oid) {
 			skip(oid)
 			continue
 		}
@@ -334,9 +434,12 @@ func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string)) (int, error
 		}
 		data := make([]byte, obj.Size())
 		_, err = io.ReadFull(rd, data)
-		rd.Close()
+		closeErr := rd.Close()
 		if err != nil {
 			return total, err
+		}
+		if closeErr != nil {
+			return total, closeErr
 		}
 		jobs <- job{oid: oid, data: data}
 	}
@@ -344,40 +447,56 @@ func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string)) (int, error
 
 func matchBlob(ctx context.Context, m *licenses.Matcher, data []byte) blobResult {
 	if bytes.IndexByte(data, 0) >= 0 {
-		return blobResult{skipped: "binary"}
+		return blobResult{skipped: skippedBinary}
 	}
 	res, err := m.Match(ctx, data)
 	if err != nil {
-		return blobResult{skipped: "error"}
-	}
-	if len(res.Detections) == 0 {
-		return blobResult{}
+		return blobResult{skipped: skippedError}
 	}
 	exprs := make([]string, 0, len(res.Detections))
 	for _, d := range res.Detections {
 		exprs = append(exprs, d.Expression)
 	}
 	sort.Strings(exprs)
-	return blobResult{expressions: exprs}
+	return blobResult{expressions: exprs, spdx: len(res.SPDXDeclarations) > 0}
 }
 
-// listBlobs returns every unique blob OID reachable from any ref.
-func listBlobs(repo string) ([]string, error) {
-	cmd := exec.Command("git", "-C", repo, "cat-file",
+// listBlobs includes unreachable objects in the object store.
+func listBlobs(ctx context.Context, repo string, visit func(string) error) (int, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "cat-file",
 		"--batch-all-objects", "--batch-check=%(objecttype) %(objectname)",
 		"--unordered")
-	out, err := cmd.Output()
+	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, gitErr("cat-file --batch-all-objects", err)
+		return 0, err
 	}
-	var oids []string
-	for _, line := range bytes.Split(out, []byte("\n")) {
-		if !bytes.HasPrefix(line, []byte("blob ")) {
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	total := 0
+	scanner := bufio.NewScanner(out)
+	for scanner.Scan() {
+		oid, ok := strings.CutPrefix(scanner.Text(), "blob ")
+		if !ok {
 			continue
 		}
-		oids = append(oids, string(line[5:]))
+		total++
+		if err = visit(oid); err != nil {
+			break
+		}
 	}
-	return oids, nil
+	if err == nil {
+		err = scanner.Err()
+	}
+	if err != nil {
+		_ = cmd.Process.Kill()
+	}
+	waitErr := cmd.Wait()
+	if err != nil {
+		return total, err
+	}
+	return total, waitErr
 }
 
 type catFile struct {
@@ -400,10 +519,10 @@ func newCatFile(repo string) (*catFile, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &catFile{cmd: cmd, in: in, out: bufio.NewReaderSize(out, 1<<16)}, nil
+	return &catFile{cmd: cmd, in: in, out: bufio.NewReaderSize(out, readerBufferSize)}, nil
 }
 
-func (c *catFile) read(oid string) (typ string, size int, data []byte, err error) {
+func (c *catFile) read(oid string, limit int64) (typ string, size int, data []byte, err error) {
 	if _, err = fmt.Fprintln(c.in, oid); err != nil {
 		return
 	}
@@ -412,7 +531,7 @@ func (c *catFile) read(oid string) (typ string, size int, data []byte, err error
 		return
 	}
 	parts := strings.Fields(strings.TrimSpace(header))
-	if len(parts) < 3 {
+	if len(parts) < catHeaderFields {
 		err = fmt.Errorf("cat-file header: %q", header)
 		return
 	}
@@ -421,7 +540,7 @@ func (c *catFile) read(oid string) (typ string, size int, data []byte, err error
 	if err != nil {
 		return
 	}
-	if int64(size) <= *maxBlobSize {
+	if int64(size) <= limit {
 		data = make([]byte, size)
 		if _, err = io.ReadFull(c.out, data); err != nil {
 			return
@@ -437,101 +556,18 @@ func (c *catFile) read(oid string) (typ string, size int, data []byte, err error
 }
 
 func (c *catFile) close() {
-	c.in.Close()
-	c.cmd.Wait()
+	_ = c.in.Close()
+	_ = c.cmd.Wait()
 }
 
-// logCmd walks all commits and reports where a path's detected expressions changed.
-func logCmd(repo string) error {
-	ctx := context.Background()
-	m, err := licenses.New()
-	if err != nil {
-		return err
-	}
-	idx := &index{blobs: make(map[string]blobResult, 1<<16), interned: make(map[string]string, 128)}
-	if _, err := scanBlobs(ctx, repo, m, idx); err != nil {
-		return err
-	}
-
-	if out, _ := exec.Command("git", "-C", repo, "rev-parse", "--is-shallow-repository").Output(); bytes.HasPrefix(out, []byte("true")) {
-		fmt.Fprintln(os.Stderr, "git-spdx: warning: shallow clone; grafted commits will show every file as added")
-	}
-
-	cmd := exec.Command("git", "-C", repo, "log", "--all", "--date-order",
-		"--no-abbrev", "--raw", "--no-renames",
-		"--format=%x00%H%x00%aI%x00%s")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return gitErr("log --raw", err)
-	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
-
-	var commit, date, subject string
-	printed := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "\x00") {
-			f := strings.SplitN(line[1:], "\x00", 3)
-			commit, date, subject = f[0], f[1], f[2]
-			printed = false
-			continue
-		}
-		if !strings.HasPrefix(line, ":") {
-			continue
-		}
-		oldOID, newOID, path, ok := parseRaw(line)
-		if !ok {
-			continue
-		}
-		before := lookup(idx, oldOID)
-		after := lookup(idx, newOID)
-		if equalExprs(before, after) {
-			continue
-		}
-		if !printed {
-			fmt.Printf("%s  %s  %s\n", commit[:12], date[:10], subject)
-			printed = true
-		}
-		fmt.Printf("  %s\n", path)
-		if len(before) > 0 {
-			fmt.Printf("    - %s\n", strings.Join(before, ", "))
-		}
-		if len(after) > 0 {
-			fmt.Printf("    + %s\n", strings.Join(after, ", "))
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("git log --raw: %w", err)
-	}
-	return cmd.Wait()
-}
-
-func parseRaw(line string) (oldOID, newOID, path string, ok bool) {
-	// :100644 100644 <old> <new> M\t<path>
-	tab := strings.IndexByte(line, '\t')
-	if tab < 0 {
-		return
-	}
-	f := strings.Fields(line[:tab])
-	if len(f) < 5 {
-		return
-	}
-	return f[2], f[3], line[tab+1:], true
-}
-
-func lookup(idx *index, oid string) []string {
+func lookup(idx *index, oid string) blobResult {
 	if oid == "" || oid == zeroOID || oid == zeroOIDSHA256 {
-		return nil
+		return blobResult{}
 	}
 	if r, ok := idx.get(oid); ok {
-		return r.expressions
+		return r
 	}
-	return nil
+	return blobResult{}
 }
 
 func equalExprs(a, b []string) bool {
@@ -563,8 +599,8 @@ func printExprCounts(idx *index) {
 	}
 	sort.Slice(s, func(i, j int) bool { return s[i].v > s[j].v })
 	for i, e := range s {
-		if i >= 20 {
-			fmt.Printf("  ... %d more\n", len(s)-20)
+		if i >= expressionDisplayLimit {
+			fmt.Printf("  ... %d more\n", len(s)-expressionDisplayLimit)
 			break
 		}
 		fmt.Printf("  %6d  %s\n", e.v, e.k)
@@ -580,11 +616,4 @@ func human(n int64) string {
 		i++
 	}
 	return fmt.Sprintf("%.1f %s", f, units[i])
-}
-
-func gitErr(what string, err error) error {
-	if ee, ok := err.(*exec.ExitError); ok {
-		return fmt.Errorf("git %s: %s", what, bytes.TrimSpace(ee.Stderr))
-	}
-	return fmt.Errorf("git %s: %w", what, err)
 }
