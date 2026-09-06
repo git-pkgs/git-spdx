@@ -2,18 +2,28 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-const mitExpression = "MIT"
+const (
+	mitExpression     = "MIT"
+	testGitExecutable = "git"
+)
 
 func TestMain(m *testing.M) {
+	name := strings.TrimSuffix(strings.ToLower(filepath.Base(os.Args[0])), ".exe")
+	if os.Getenv("GIT_SPDX_TEST_GIT_WRAPPER") == "1" && name == testGitExecutable {
+		os.Exit(runGitWrapper())
+	}
 	if os.Getenv("GIT_SPDX_TEST_CLI") == "1" {
 		main()
 		os.Exit(0)
@@ -102,7 +112,8 @@ func TestCLIIncompleteComparison(t *testing.T) {
 
 func TestCLIHistoryGroupsAndPaths(t *testing.T) {
 	repo := repository(t)
-	for _, name := range []string{"LICENSE", "src/component/LICENSE", "LICENSES/odd\n\t雪.txt", "source.go"} {
+	oddPath := testLegalPath()
+	for _, name := range []string{"LICENSE", "src/component/LICENSE", oddPath, "source.go"} {
 		commitFile(t, repo, name, "// SPDX-License-Identifier: MIT\n", "Add "+strconv.Quote(name))
 	}
 	out := cli(t, "log", repo)
@@ -112,7 +123,7 @@ func TestCLIHistoryGroupsAndPaths(t *testing.T) {
 		}
 	}
 	out = cli(t, "log", repo, "--group", "legal", "--details")
-	if !strings.Contains(out, `"LICENSES/odd\n\t雪.txt"`) || strings.Contains(out, "[other]") || strings.Contains(out, "root:") {
+	if !strings.Contains(out, strconv.Quote(oddPath)) || strings.Contains(out, "[other]") || strings.Contains(out, "root:") {
 		t.Fatalf("filter or NUL-delimited path handling failed:\n%s", out)
 	}
 }
@@ -121,20 +132,22 @@ func TestCLILogUsesSingleHistoryWalk(t *testing.T) {
 	repo := repository(t)
 	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
 	commitFile(t, repo, "source.go", "// SPDX-License-Identifier: MIT\n", "Add source")
-	realGit, err := exec.LookPath("git")
+	realGit, err := exec.LookPath(testGitExecutable)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrapperDir := t.TempDir()
-	wrapper := filepath.Join(wrapperDir, "git")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_SPDX_GIT_TRACE\"\nexec " + realGit + " \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(script), 0755); err != nil {
-		t.Fatal(err)
+	wrapperName := testGitExecutable
+	if runtime.GOOS == "windows" {
+		wrapperName += ".exe"
 	}
+	copyExecutable(t, os.Args[0], filepath.Join(wrapperDir, wrapperName))
 	trace := filepath.Join(t.TempDir(), "git.log")
 	cmd := exec.Command(os.Args[0], "log", repo)
 	cmd.Env = append(os.Environ(),
 		"GIT_SPDX_TEST_CLI=1",
+		"GIT_SPDX_TEST_GIT_WRAPPER=1",
+		"GIT_SPDX_REAL_GIT="+realGit,
 		"GIT_SPDX_GIT_TRACE="+trace,
 		"GOMAXPROCS=2",
 		"PATH="+wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"),
@@ -156,6 +169,59 @@ func TestCLILogUsesSingleHistoryWalk(t *testing.T) {
 	if walks != 1 {
 		t.Fatalf("git log subprocesses = %d, want 1\n%s", walks, data)
 	}
+}
+
+func testLegalPath() string {
+	if runtime.GOOS == "windows" {
+		return "LICENSES/odd 雪.txt"
+	}
+	return "LICENSES/odd\n\t雪.txt"
+}
+
+func copyExecutable(t *testing.T, source, destination string) {
+	t.Helper()
+	in, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runGitWrapper() int {
+	trace, err := os.OpenFile(os.Getenv("GIT_SPDX_GIT_TRACE"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	_, writeErr := fmt.Fprintln(trace, strings.Join(os.Args[1:], " "))
+	closeErr := trace.Close()
+	if writeErr != nil || closeErr != nil {
+		fmt.Fprintln(os.Stderr, "writing Git trace failed")
+		return 1
+	}
+	cmd := exec.Command(os.Getenv("GIT_SPDX_REAL_GIT"), os.Args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return exitError.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
 }
 
 const mitNotice = `Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -351,7 +417,7 @@ func TestCLIMatcherErrorRemainsIncomplete(t *testing.T) {
 
 func git(t *testing.T, repo string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	cmd := exec.Command(testGitExecutable, append([]string{"-C", repo}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -72,7 +72,7 @@ func TestGitFreePackedHistory(t *testing.T) {
 			repo := repository(t, "--object-format="+format)
 			commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
 			commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Change license")
-			commitFile(t, repo, "LICENSES/odd\n雪.txt", "SPDX-License-Identifier: MIT\n", "Add vendor notice")
+			commitFile(t, repo, testLegalPath(), "SPDX-License-Identifier: MIT\n", "Add vendor notice")
 			git(t, repo, "gc", "--quiet")
 			want := cli(t, "log", repo, "--details")
 			got := cliWithoutGit(t, "log", repo, "--details")
