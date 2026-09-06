@@ -2,6 +2,8 @@ module github.com/git-pkgs/git-spdx
 
 go 1.26.0
 
+toolchain go1.26.7
+
 require github.com/git-pkgs/licenses v0.7.1-0.20260906201711-03e6909a1db1
 
 require (

@@ -144,3 +144,7 @@ for profiling a single run.
 - Legal-path caps follow `licenses.LegalFileRoles`. Names such as
   `license.rs` are included; `THIRD_PARTY_LICENSES.txt` and `PATENTS` are not.
 - No `blame` or `diff A..B` subcommands yet.
+
+## License
+
+MIT
