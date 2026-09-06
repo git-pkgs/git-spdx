@@ -22,17 +22,19 @@ import (
 	"time"
 
 	"github.com/git-pkgs/licenses"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v6/plumbing"
 )
 
 const (
+	goGitBackend              = "gogit"
 	defaultMaxBlobSize        = 1 << 20
 	defaultLegalBlobSize      = 8 << 20
 	initialBlobCapacity       = 1 << 16
 	initialExpressionCapacity = 128
 	readerBufferSize          = 1 << 16
 	jobQueueSize              = 256
+	jobBatchSize              = 64
+	jobBatchBytes             = 8 << 20
 	usageExitCode             = 2
 	catHeaderFields           = 3
 	expressionDisplayLimit    = 20
@@ -43,9 +45,9 @@ const (
 var (
 	cpuProfile    = flag.String("cpuprofile", "", "write CPU profile of the blob scan to file")
 	memProfile    = flag.String("memprofile", "", "write heap profile after the blob scan to file")
-	backend       = flag.String("backend", "git", "object reader: git (cat-file) or gogit")
+	backend       = flag.String("backend", "git", "backend: git (subprocesses) or gogit (Git-free)")
 	maxBlobSize   = flag.Int64("max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
-	readers       = flag.Int("readers", 0, "cat-file reader processes (0 = GOMAXPROCS)")
+	readers       = flag.Int("readers", 0, "blob readers (0 = GOMAXPROCS for git, 1 for gogit)")
 	legalBlobSize = flag.Int64("max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
 	details       = flag.Bool("details", false, "print individual history changes")
 	group         = flag.String("group", groupAll, "history group: all, root, legal, other")
@@ -55,9 +57,18 @@ var (
 func main() {
 	flag.Usage = usage
 	flag.Parse()
+	if err := configureGoGitZlib(); err != nil {
+		fatal(err)
+	}
 	args := flag.Args()
 	if *maxBlobSize < 0 || *legalBlobSize < 0 {
 		fatal(fmt.Errorf("blob size limits must be non-negative"))
+	}
+	if *goGitObjectBuffer < 0 {
+		fatal(fmt.Errorf("go-git object buffer must be non-negative"))
+	}
+	if *goGitObjectBatch <= 0 {
+		fatal(fmt.Errorf("go-git object batch must be positive"))
 	}
 	if !slices.Contains([]string{groupAll, groupRoot, groupLegal, groupOther}, *group) {
 		fatal(fmt.Errorf("unknown history group %q", *group))
@@ -233,6 +244,8 @@ func scan(repo string) error {
 	}
 
 	fmt.Printf("matcher load        %8s\n", loadDur.Round(time.Millisecond))
+	fmt.Printf("legal discovery     %8s\n", stats.legalElapsed.Round(time.Millisecond))
+	fmt.Printf("blob processing     %8s\n", stats.blobElapsed.Round(time.Millisecond))
 	fmt.Printf("blob scan           %8s\n", stats.elapsed.Round(time.Millisecond))
 	fmt.Printf("total               %8s\n", (loadDur + stats.elapsed).Round(time.Millisecond))
 	fmt.Printf("blobs seen          %8d\n", stats.total)
@@ -256,7 +269,8 @@ type scanStats struct {
 	total, matched, hits            int
 	skipSize, skipBinary, skipError int
 	bytes                           int64
-	elapsed                         time.Duration
+	elapsed, legalElapsed           time.Duration
+	blobElapsed                     time.Duration
 }
 
 type job struct {
@@ -269,12 +283,23 @@ func scanBlobs(ctx context.Context, repo string, m *licenses.Matcher, idx *index
 }
 
 func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *index, feed feeder) (scanStats, error) {
-	var stats scanStats
 	t0 := time.Now()
 	legal, err := legalBlobs(repo)
 	if err != nil {
-		return stats, err
+		return scanStats{}, err
 	}
+	legalElapsed := time.Since(t0)
+	reportBenchmarkPhase("legal", t0)
+	stats, err := scanBlobsWithLegal(ctx, repo, m, idx, feed, legal)
+	stats.legalElapsed = legalElapsed
+	stats.elapsed = time.Since(t0)
+	return stats, err
+}
+
+func scanBlobsWithLegal(ctx context.Context, repo string, m *licenses.Matcher, idx *index, feed feeder, legal map[string]bool) (scanStats, error) {
+	var stats scanStats
+	var err error
+	t0 := time.Now()
 	limit := func(oid string) int64 {
 		if legal[oid] {
 			return max(*maxBlobSize, *legalBlobSize)
@@ -322,22 +347,40 @@ func scanBlobsWith(ctx context.Context, repo string, m *licenses.Matcher, idx *i
 	}
 
 	stats.total, err = feed(repo, jobs, skip, limit)
+	reportBenchmarkPhase("feed", t0)
 	close(jobs)
 	wg.Wait()
+	reportBenchmarkPhase("match", t0)
 	if err != nil {
 		return stats, err
 	}
 	if idx.err != nil {
 		return stats, idx.err
 	}
-	stats.elapsed = time.Since(t0)
+	stats.blobElapsed = time.Since(t0)
+	stats.elapsed = stats.blobElapsed
 	return stats, nil
+}
+
+func reportBenchmarkPhase(name string, started time.Time) {
+	if os.Getenv("GITSPDX_BENCH_PHASES") != "1" {
+		return
+	}
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	fmt.Fprintf(os.Stderr, "bench-phase name=%s elapsed=%s heap_alloc=%d heap_sys=%d\n",
+		name, time.Since(started).Round(time.Millisecond), memory.HeapAlloc, memory.HeapSys)
 }
 
 type feeder func(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error)
 
+type listedBlob struct {
+	oid  string
+	size int64
+}
+
 func feederFor(name string) feeder {
-	if name == "gogit" {
+	if name == goGitBackend {
 		return feedBlobsGoGit
 	}
 	return feedBlobsCatFile
@@ -351,7 +394,7 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 		shards = runtime.GOMAXPROCS(0)
 	}
 	shards = max(1, shards)
-	oids := make(chan string, jobQueueSize)
+	blobs := make(chan listedBlob, jobQueueSize)
 	var wg sync.WaitGroup
 	errs := make(chan error, shards)
 	for s := 0; s < shards; s++ {
@@ -365,9 +408,9 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 				return
 			}
 			defer cat.close()
-			for oid := range oids {
-				cap := limit(oid)
-				typ, size, data, err := cat.read(oid, cap)
+			for blob := range blobs {
+				cap := limit(blob.oid)
+				typ, size, data, err := cat.read(blob.oid, cap)
 				if err != nil {
 					errs <- err
 					cancel()
@@ -377,22 +420,26 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 					continue
 				}
 				if int64(size) > cap {
-					skip(oid)
+					skip(blob.oid)
 					continue
 				}
-				jobs <- job{oid: oid, data: data}
+				jobs <- job{oid: blob.oid, data: data}
 			}
 		}()
 	}
-	total, err := listBlobs(ctx, repo, func(oid string) error {
+	total, err := listBlobs(ctx, repo, func(blob listedBlob) error {
+		if blob.size > limit(blob.oid) {
+			skip(blob.oid)
+			return nil
+		}
 		select {
-		case oids <- oid:
+		case blobs <- blob:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	})
-	close(oids)
+	close(blobs)
 	wg.Wait()
 	close(errs)
 	for e := range errs {
@@ -404,19 +451,37 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 }
 
 func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
-	r, err := gogit.PlainOpen(repo)
+	if *readers > 1 {
+		return feedBlobsGoGitParallel(repo, jobs, skip, limit, *readers)
+	}
+	return feedBlobsGoGitSerial(repo, jobs, skip, limit)
+}
+
+func feedBlobsGoGitSerial(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
+	r, err := openGoGit(repo)
 	if err != nil {
 		return 0, err
 	}
+	defer func() { _ = r.Close() }()
 	iter, err := r.Storer.IterEncodedObjects(plumbing.BlobObject)
 	if err != nil {
 		return 0, err
 	}
 	defer iter.Close()
 	total := 0
+	batch := make([]job, 0, jobBatchSize)
+	batchBytes := 0
+	flush := func() {
+		for _, j := range batch {
+			jobs <- j
+		}
+		batch = batch[:0]
+		batchBytes = 0
+	}
 	for {
 		obj, err := iter.Next()
 		if err == io.EOF {
+			flush()
 			return total, nil
 		}
 		if err != nil {
@@ -441,7 +506,14 @@ func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string), limit func(
 		if closeErr != nil {
 			return total, closeErr
 		}
-		jobs <- job{oid: oid, data: data}
+		if len(batch) > 0 && batchBytes+len(data) > jobBatchBytes {
+			flush()
+		}
+		batch = append(batch, job{oid: oid, data: data})
+		batchBytes += len(data)
+		if len(batch) == cap(batch) {
+			flush()
+		}
 	}
 }
 
@@ -462,9 +534,9 @@ func matchBlob(ctx context.Context, m *licenses.Matcher, data []byte) blobResult
 }
 
 // listBlobs includes unreachable objects in the object store.
-func listBlobs(ctx context.Context, repo string, visit func(string) error) (int, error) {
+func listBlobs(ctx context.Context, repo string, visit func(listedBlob) error) (int, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", repo, "cat-file",
-		"--batch-all-objects", "--batch-check=%(objecttype) %(objectname)",
+		"--batch-all-objects", "--batch-check=%(objecttype) %(objectname) %(objectsize)",
 		"--unordered")
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -477,12 +549,17 @@ func listBlobs(ctx context.Context, repo string, visit func(string) error) (int,
 	total := 0
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
-		oid, ok := strings.CutPrefix(scanner.Text(), "blob ")
-		if !ok {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 || fields[0] != "blob" {
 			continue
 		}
+		size, parseErr := strconv.ParseInt(fields[2], 10, 64)
+		if parseErr != nil {
+			err = fmt.Errorf("parse blob size %q: %w", fields[2], parseErr)
+			break
+		}
 		total++
-		if err = visit(oid); err != nil {
+		if err = visit(listedBlob{oid: fields[1], size: size}); err != nil {
 			break
 		}
 	}
@@ -597,7 +674,12 @@ func printExprCounts(idx *index) {
 	for k, v := range counts {
 		s = append(s, kv{k, v})
 	}
-	sort.Slice(s, func(i, j int) bool { return s[i].v > s[j].v })
+	sort.Slice(s, func(i, j int) bool {
+		if s[i].v != s[j].v {
+			return s[i].v > s[j].v
+		}
+		return s[i].k < s[j].k
+	})
 	for i, e := range s {
 		if i >= expressionDisplayLimit {
 			fmt.Printf("  ... %d more\n", len(s)-expressionDisplayLimit)

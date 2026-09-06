@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -56,6 +58,34 @@ func TestCLILegalBlobCaps(t *testing.T) {
 	}
 }
 
+func TestListBlobsReportsObjectSizes(t *testing.T) {
+	repo := repository(t)
+	content := strings.Repeat("large blob contents\n", 100)
+	commitFile(t, repo, "large.txt", content, "Add large blob")
+	cmd := exec.Command("git", "-C", repo, "rev-parse", "HEAD:large.txt")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oid := strings.TrimSpace(string(out))
+	found := false
+	_, err = listBlobs(context.Background(), repo, func(blob listedBlob) error {
+		if blob.oid == oid {
+			found = true
+			if blob.size != int64(len(content)) {
+				t.Fatalf("blob size = %d, want %d", blob.size, len(content))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("blob %s was not enumerated", oid)
+	}
+}
+
 func TestCLIIncompleteComparison(t *testing.T) {
 	for _, content := range []string{strings.Repeat("x", 2000), "binary\x00content"} {
 		t.Run(strconv.Itoa(len(content)), func(t *testing.T) {
@@ -84,6 +114,47 @@ func TestCLIHistoryGroupsAndPaths(t *testing.T) {
 	out = cli(t, "-group", "legal", "-details", "log", repo)
 	if !strings.Contains(out, `"LICENSES/odd\n\t雪.txt"`) || strings.Contains(out, "[other]") || strings.Contains(out, "root:") {
 		t.Fatalf("filter or NUL-delimited path handling failed:\n%s", out)
+	}
+}
+
+func TestCLILogUsesSingleHistoryWalk(t *testing.T) {
+	repo := repository(t)
+	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
+	commitFile(t, repo, "source.go", "// SPDX-License-Identifier: MIT\n", "Add source")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapperDir := t.TempDir()
+	wrapper := filepath.Join(wrapperDir, "git")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_SPDX_GIT_TRACE\"\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	trace := filepath.Join(t.TempDir(), "git.log")
+	cmd := exec.Command(os.Args[0], "log", repo)
+	cmd.Env = append(os.Environ(),
+		"GIT_SPDX_TEST_CLI=1",
+		"GIT_SPDX_GIT_TRACE="+trace,
+		"GOMAXPROCS=2",
+		"PATH="+wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git spdx log: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walks := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(" "+line+" ", " log ") {
+			walks++
+		}
+	}
+	if walks != 1 {
+		t.Fatalf("git log subprocesses = %d, want 1\n%s", walks, data)
 	}
 }
 
@@ -194,6 +265,41 @@ func TestCLIHelp(t *testing.T) {
 	}
 }
 
+func TestCLIExpressionSummaryBreaksCountTiesByName(t *testing.T) {
+	repo := repository(t)
+	ids := []string{
+		"0BSD", "AGPL-3.0-only", "Apache-2.0", "Artistic-2.0", "BlueOak-1.0.0",
+		"BSD-2-Clause", "BSD-3-Clause", "BSL-1.0", "CC0-1.0", "CDDL-1.0",
+		"EPL-2.0", "EUPL-1.2", "GPL-2.0-only", "GPL-3.0-only", "ISC",
+		"LGPL-2.1-only", "MIT", "MIT-0", "MPL-2.0", "Unlicense", "WTFPL", "Zlib",
+	}
+	for index, id := range ids {
+		name := filepath.Join(repo, "file-"+strconv.Itoa(index)+".txt")
+		if err := os.WriteFile(name, []byte("SPDX-License-Identifier: "+id+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "Add SPDX declarations")
+
+	out := cli(t, "scan", repo)
+	summary := strings.Split(out, "expressions across all history:\n")
+	if len(summary) != 2 {
+		t.Fatal(out)
+	}
+	var got []string
+	for _, line := range strings.Split(summary[1], "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "1" {
+			continue
+		}
+		got = append(got, fields[1])
+	}
+	if len(got) != expressionDisplayLimit || !slices.IsSorted(got) {
+		t.Fatalf("expression summary is not sorted by name: %q\n%s", got, out)
+	}
+}
+
 func TestCLILegalPathIntroducedByMerge(t *testing.T) {
 	repo := repository(t)
 	content := "SPDX-License-Identifier: MIT\n" + strings.Repeat("x\n", 100)
@@ -283,5 +389,21 @@ func TestCLI(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCLIBenchmarkPhases(t *testing.T) {
+	repo := repository(t)
+	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
+	cmd := exec.Command(os.Args[0], "-backend=gogit", "scan", repo)
+	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GITSPDX_BENCH_PHASES=1", "GOMAXPROCS=2")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git spdx: %v\n%s", err, out)
+	}
+	for _, phase := range []string{"legal", "feed", "match"} {
+		if !strings.Contains(string(out), "bench-phase name="+phase+" ") {
+			t.Fatalf("missing %s phase:\n%s", phase, out)
+		}
 	}
 }

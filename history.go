@@ -27,16 +27,20 @@ type change struct {
 	commit, date, subject string
 	oldOID, newOID, path  string
 	oldMode, newMode      string
+	merge                 bool
 }
 
 func walkChanges(repo string, merges bool, visit func(change)) error {
+	if *backend == goGitBackend {
+		return walkChangesGoGit(repo, merges, visit)
+	}
 	mergeMode := "off"
 	if merges {
 		mergeMode = "first-parent"
 	}
 	cmd := exec.Command("git", "-C", repo, "log", "--all", "--date-order",
 		"--root", "--no-abbrev", "--raw", "--no-renames", "-z",
-		"--diff-merges="+mergeMode, "--format=%x01%H%x00%aI%x00%s")
+		"--diff-merges="+mergeMode, "--format=%x01%H%x00%aI%x00%P%x00%s")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -77,6 +81,11 @@ func readChanges(input io.Reader, visit func(change)) error {
 			if c.date, err = field(); err != nil {
 				return err
 			}
+			parents, err := field()
+			if err != nil {
+				return err
+			}
+			c.merge = strings.Contains(parents, " ")
 			if c.subject, err = field(); err != nil {
 				return err
 			}
@@ -99,7 +108,7 @@ func readChanges(input io.Reader, visit func(change)) error {
 }
 
 func pathGroup(path string) string {
-	if len(licenses.LegalFileRoles(path)) == 0 {
+	if !licenses.IsLegalPath(path) {
 		return groupOther
 	}
 	if !strings.Contains(path, "/") {
@@ -109,19 +118,26 @@ func pathGroup(path string) string {
 }
 
 func legalBlobs(repo string) (map[string]bool, error) {
+	if *backend == goGitBackend {
+		return legalBlobsGoGit(repo)
+	}
 	legal := make(map[string]bool)
 	err := walkChanges(repo, true, func(c change) {
-		if pathGroup(c.path) == groupOther {
-			return
-		}
-		if c.oldMode != "000000" && c.oldMode != "160000" {
-			legal[c.oldOID] = true
-		}
-		if c.newMode != "000000" && c.newMode != "160000" {
-			legal[c.newOID] = true
-		}
+		recordLegalChange(legal, c)
 	})
 	return legal, err
+}
+
+func recordLegalChange(legal map[string]bool, c change) {
+	if pathGroup(c.path) == groupOther {
+		return
+	}
+	if c.oldMode != "000000" && c.oldMode != "120000" && c.oldMode != "160000" {
+		legal[c.oldOID] = true
+	}
+	if c.newMode != "000000" && c.newMode != "120000" && c.newMode != "160000" {
+		legal[c.newOID] = true
+	}
 }
 
 type historyTotals struct {
@@ -135,17 +151,26 @@ func logCmd(repo string) error {
 	if err != nil {
 		return err
 	}
-	idx := newIndex()
-	if _, err := scanBlobs(context.Background(), repo, m, idx); err != nil {
+	spool, legal, err := spoolLogHistory(repo)
+	if err != nil {
 		return err
 	}
-	if out, _ := exec.Command("git", "-C", repo, "rev-parse", "--is-shallow-repository").Output(); bytes.HasPrefix(out, []byte("true")) {
+	defer spool.close()
+	idx := newIndex()
+	if _, err := scanBlobsWithLegal(context.Background(), repo, m, idx, feederFor(*backend), legal); err != nil {
+		return err
+	}
+	shallow, err := isShallow(repo)
+	if err != nil {
+		return err
+	}
+	if shallow {
 		fmt.Fprintln(os.Stderr, "git-spdx: warning: shallow clone; grafted commits will show every file as added")
 	}
 	totals := map[string]*historyTotals{groupRoot: {}, groupLegal: {}, groupOther: {}}
 	months := make(map[string]*historyTotals)
 	lastPrinted := ""
-	err = walkChanges(repo, false, func(c change) {
+	err = spool.replay(func(c change) {
 		role := pathGroup(c.path)
 		if *group != groupAll && *group != role {
 			return
@@ -191,6 +216,14 @@ func logCmd(repo string) error {
 			role, t.commits, t.expressions, t.additions, t.deletions, t.incomplete, t.spdxAdded, t.spdxRemoved)
 	}
 	return nil
+}
+
+func isShallow(repo string) (bool, error) {
+	if *backend == goGitBackend {
+		return isShallowGoGit(repo)
+	}
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "--is-shallow-repository").Output()
+	return bytes.HasPrefix(out, []byte("true")), err
 }
 
 func printChange(c change, role, kind string, before, after blobResult) {

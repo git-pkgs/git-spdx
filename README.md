@@ -1,12 +1,18 @@
 # git-spdx
 
-License-scan every blob in a git repository's object store and report where
-detected SPDX expressions changed across the commit graph.
+Scan every blob in a Git repository's object store and report where detected
+SPDX expressions changed across the commit graph. Detections are cached by
+blob object ID, so each unique piece of content is matched once regardless of
+how many commits or paths reference it.
 
-Uses `github.com/git-pkgs/licenses` for detection and shells out to
-`git cat-file --batch` for object reading. Detections are cached by blob SHA,
-so each unique piece of content is matched once regardless of how many
-commits or paths reference it.
+The default backend uses native Git subprocesses. The `gogit` backend reads
+the repository and its history in Go, so the binary can run on a machine
+without Git installed. Both backends use `github.com/git-pkgs/licenses` for
+license detection.
+
+```bash
+go build -o git-spdx .
+```
 
 ## Commands
 
@@ -16,6 +22,7 @@ git spdx log  [repo]   # summarise detected changes by path group
 git spdx -details log [repo]  # include individual commits and paths
 git spdx -group legal -details log [repo]
 git spdx -monthly log [repo] > monthly.csv
+git spdx -backend=gogit scan [repo]  # run without Git subprocesses
 ```
 
 Drop the `git-spdx` binary on `$PATH` to use it as a git subcommand.
@@ -49,19 +56,38 @@ Set `-max-blob-size` and `-max-legal-blob-size` in bytes to change these
 limits; legal blobs use the larger value. A zero limit permits only empty
 blobs. Size, binary, and matcher-error skips are reported separately.
 
+## Backends
+
+Native Git remains the default. It uses parallel `git cat-file` processes and
+accepts `-readers=0` as `GOMAXPROCS`. Peak memory comparisons should include
+the `git-spdx` process and all of its child processes.
+
+The Git-free backend supports pack index mmap, parallel object readers,
+parallel history work, a sharded object cache, and klauspost zlib. The settings
+used for the Cargo benchmark below were:
+
+```bash
+git spdx -backend=gogit -gogit-mmap -gogit-klauspost-zlib \
+  -readers=8 -history-workers=6 \
+  -gogit-cache-bytes=100663296 -gogit-cache-shards=8 scan [repo]
+```
+
+Repositories using replacement refs, grafts, object-directory environment
+overrides, or non-empty object alternates return an error under the Git-free
+backend. This prevents partial history scans.
+
 ## Numbers
 
-M1 Pro, 8 cores, 16 GB, go1.26.7.
+Two-run averages on an M1 Pro with 8 cores and 16 GB, scanning
+`rust-lang/cargo` at `a07c49a989d565727725e5bb5a8038ff402006a8`:
 
-| repo | commits | blobs | scan wall | peak RSS | log wall |
-|---|---|---|---|---|---|
-| rust-lang/cargo | 23,052 | 57,529 | 6.1 s | 306 MB | - |
-| rubygems/rubygems | 48,222 | 91,478 | 4.4 s | 476 MB | 8.1 s |
-| homebrew-core | 828,252 | 708,799 | 17.6 s | 1.30 GB | 187 s |
-| kubernetes/kubernetes | 161,360 | 578,039 | 48.4 s | 1.11 GB | 58.3 s |
+| backend | wall | CPU | peak process-tree RSS |
+|---|---:|---:|---:|
+| native Git | 4.07 s | 20.17 s | 2.10 GiB |
+| Git-free | 3.55 s | 20.33 s | 606 MiB |
 
-rubygems `log` reports 291 commits with license transitions back to 2004,
-including LICENSE.txt moving GPL-1.0-or-later to BSD-2-Clause to MIT.
+Both backends reported 57,969 blobs seen, 57,967 matched, 5,761 with license
+hits, two size skips, and 33 binary skips. Their normalized output was equal.
 
 ## Benchmarks
 
@@ -78,7 +104,7 @@ subtests; `BenchmarkMatcherLoad` measures that separately.
 Add `-cpuprofile` and `-memprofile` to the built binary's `scan` command
 for profiling a single run.
 
-## Spike limitations
+## Limitations
 
 - `log` walks `--all` refs; shallow clones report every file as added at the
   graft point (a warning is printed).
