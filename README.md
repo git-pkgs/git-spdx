@@ -1,149 +1,159 @@
 # git-spdx
 
-Find when detected licenses and SPDX declarations changed across a Git
-repository's entire history. git-spdx matches each unique blob once and
-replays commit history against the cached results, avoiding a full scan of
-every revision.
+A Git subcommand for tracing detected licenses across a repository's history.
+It shows when license expressions change, when matched files are added or
+removed, and when `SPDX-License-Identifier` declarations appear or disappear,
+with the commit and path behind each change.
+It scans large histories in seconds. That speed makes it practical to trace
+license evidence through every revision, even in a large repository.
+On an 8-core M1 Pro, the default native Git backend scanned 1.3 GB of blobs
+across Cargo's 23,190 commits in an average of 4.05 seconds.
 
-The default backend uses native Git subprocesses. The `gogit` backend reads
-the repository and its history in Go, so the binary can run on a machine
-without Git installed. License detection comes from
-[git-pkgs/licenses](https://github.com/git-pkgs/licenses).
+The `licenses` command reports what the current checkout contains. `git-spdx`
+adds the timeline, so it can answer questions such as:
+
+- When did a GPL expression first appear in this repository?
+- Which commit changed the detected license for a vendored dependency?
+- When was an SPDX declaration added to or removed from a source file?
+- How has the mix of detected licenses changed month by month?
+
+[git-pkgs/licenses](https://github.com/git-pkgs/licenses) does the license
+matching. Its embedded ScanCode rules find license texts, notices, and SPDX
+declarations. `git-spdx` adds the history layer: it matches each unique Git
+blob once, then compares those results across commits. Repeated content costs
+one match even when it appears in many revisions or paths.
+
+## Install
+
+Download a prebuilt archive for macOS, Linux, or Windows from
+[GitHub Releases](https://github.com/git-pkgs/git-spdx/releases), then put the
+`git-spdx` binary on your `PATH`. The binary name also makes `git spdx`
+available.
+
+To build from source with Go 1.26:
 
 ```bash
+git clone https://github.com/git-pkgs/git-spdx.git
+cd git-spdx
 go build -o git-spdx .
 ```
 
-The module pins public fork patches through `replace` directives, so
-`go install github.com/git-pkgs/git-spdx@latest` refuses to install it.
-Clone the repository and run the build command above until those changes land
-upstream. [git-pkgs/go-git](https://github.com/git-pkgs/go-git) carries the
-correctness and packed-object reader changes prepared for upstream review;
-[git-pkgs/go-billy](https://github.com/git-pkgs/go-billy) supplies its mmap
-file views.
+## Quick start
 
-## Commands
+Run these commands inside a repository:
 
 ```bash
-git spdx scan [repo]   # match every blob, print throughput and expression histogram
-git spdx log  [repo]   # summarise detected changes by path group
-git spdx log [repo] --details  # include individual commits and paths
-git spdx log [repo] --group legal --details
-git spdx log [repo] --monthly > monthly.csv
-git spdx scan [repo] --backend=gogit  # run without Git subprocesses
+git spdx log                  # summarize license changes across history
+git spdx log --details        # show the commits and paths behind each change
+git spdx log --group root     # only root license and notice files
+git spdx log --group legal    # only legal files below the repository root
+git spdx log --monthly > license-history.csv
 ```
 
-Drop the `git-spdx` binary on `$PATH` to use it as a git subcommand.
-Options follow the command and may appear before or after the repository path.
+Pass another local repository as the argument when needed:
 
-`log` groups paths as `root` (root legal files), `legal` (legal files in
-subdirectories), and `other`. Legal filenames and directories use
-`licenses.LegalFileRoles`; a subdirectory does not establish that a file
-is vendored. Use `--group root`, `--group legal`, or `--group other` to filter
-the report.
+```bash
+git spdx log /path/to/repository --details
+```
 
-## Example
-
-Kubernetes picked up go-yaml's LGPL-to-Apache license change on 2018-01-16,
-18 months after the upstream change. `git spdx log --details --group legal`
-reported the vendored transition:
+For example, a detailed Kubernetes history report finds this change in a
+vendored copy of go-yaml:
 
 ```text
-713b1fc396a1  2018-01-16  bump(gopkg.in/yaml.v2): 670d4cf...
+713b1fc396a1  2018-01-16  bump(gopkg.in/yaml.v2): 670d4cfef0544295bc27a114dbac37980d83185a
   [legal] "vendor/gopkg.in/yaml.v2/LICENSE" (expressions changed)
     - LGPL-3.0-or-later WITH LGPL-3.0-linking-exception
     + Apache-2.0
 ```
 
-The report counts file additions and deletions separately from expression
-changes in existing files. It also counts files gaining or losing a parsed
-SPDX declaration, including when the detected expression stays the same.
-These are changes in detected evidence, which can include corrections or
-new declarations of existing terms. They do not establish relicensing.
-Skipped blobs produce incomplete comparisons, never inferred license
-additions or removals. Repeated notices with the same expression do not
-produce expression changes.
+This records a change in the detected evidence. A vendored file, corrected
+notice, or newly added declaration can change the report without establishing
+that the repository itself was relicensed.
 
-`--monthly` writes CSV grouped by author month and path group. Commit counts
-include reported changes and incomplete comparisons. They are distinct
-within each group; a commit touching several groups appears in each.
-The SPDX columns count files gaining or losing their first/last
-parsed declaration, including file additions and deletions.
+## Commands
 
-The default text limit is 1 MiB, raised to 8 MiB for any blob that appears
-at a legal path in reachable history. Every historical path occurrence
-contributes to eligibility, including deleted legal files and shared blobs.
-Set `--max-blob-size` and `--max-legal-blob-size` in bytes to change these
-limits; legal blobs use the larger value. A zero limit permits only empty
-blobs. Size, binary, and matcher-error skips are reported separately.
+### `log`
+
+`git spdx log` reports commits with changes to detected expressions, files, or
+SPDX declarations. Add `--details` to print each commit and path.
+
+Paths are split into three groups:
+
+- `root`: recognized legal files in the repository root
+- `legal`: recognized legal files in subdirectories, including vendored files
+- `other`: every other matched file
+
+Use `--group root`, `--group legal`, or `--group other` to select one group.
+Without a filter, the summary includes all three. `--monthly` writes CSV with
+commit and change counts by author month and path group.
+
+File additions and deletions are counted separately from expression changes.
+The report also tracks files gaining or losing a parsed SPDX declaration, even
+when the detected expression stays the same. Repeated notices with the same
+expression do not create an expression change.
+
+### `scan`
+
+`git spdx scan` matches every blob in the local object store and prints scan
+timings, blob counts, skip reasons, and an expression histogram for the whole
+history:
+
+```bash
+git spdx scan
+git spdx scan /path/to/repository
+```
+
+Use `scan` to inspect the complete historical license mix or measure matcher
+performance. Use `log` when you need the commits that introduced a change.
+
+## License matching
+
+The `licenses` matcher checks whole-text hashes, parsed
+`SPDX-License-Identifier` lines, and license-rule token sequences. Longer
+license and notice matches allow copyright holders and years to vary. The
+corpus is embedded, and matching runs locally without network access, cgo, or
+Python.
+
+Skipped blobs and matcher errors are reported. When one side of a comparison
+was skipped, `log` marks it incomplete instead of inferring that a license was
+added or removed.
 
 ## Backends
 
-Native Git remains the default. It uses parallel `git cat-file` processes and
-accepts `--readers=0` as `GOMAXPROCS`. Peak memory comparisons should include
-the `git-spdx` process and all of its child processes.
+The default `git` backend uses parallel `git cat-file` processes and requires
+Git on `PATH`. Set `--readers=0` to use `GOMAXPROCS`, which is also the default.
 
-The Git-free backend supports pack index mmap, parallel object readers,
-parallel history work, a sharded object cache, and klauspost zlib. The settings
-used for the Cargo benchmark below were:
+The `gogit` backend reads objects and history in process, so it works without a
+Git executable:
 
 ```bash
-git spdx scan [repo] --backend=gogit --gogit-mmap --gogit-klauspost-zlib \
-  --readers=8 --history-workers=6 \
-  --gogit-cache-bytes=100663296 --gogit-cache-shards=8
+git spdx log --backend=gogit --details
+git spdx scan --backend=gogit
 ```
 
-Repositories using replacement refs, grafts, object-directory environment
-overrides, or non-empty object alternates return an error under the Git-free
-backend. This prevents partial history scans.
+Run either command with `--help` to see cache, mmap, object reader, and history
+worker controls for the Git-free backend.
 
-## Numbers
+## Performance
 
-Two-run averages on an M1 Pro with 8 cores and 16 GB, scanning a full clone of
-`rust-lang/cargo` with 23,190 commits dated 2014-03-04 through 2026-09-05 and
-189,074 packed objects:
+On an 8-core M1 Pro with 16 GB of memory, a full clone of `rust-lang/cargo` at
+`a07c49a` contained 23,190 commits and 1.3 GB of historical blobs. Two-run
+averages were:
 
-| backend | wall | CPU | peak process-tree RSS |
-|---|---:|---:|---:|
-| native Git | 4.05 s | 20.03 s | 2.12 GiB |
+| Backend | Wall time | CPU time | Peak process-tree RSS |
+| --- | ---: | ---: | ---: |
+| Native Git | 4.05 s | 20.03 s | 2.12 GiB |
 | Git-free | 3.57 s | 20.14 s | 614 MiB |
 
-Both backends reported 58,000 blobs seen, 57,998 matched, 5,765 with license
-hits, two size skips, and 33 binary skips. Their normalized output was equal.
-The checked-out Cargo tree at `a07c49a` has 2,950 files and takes 0.65 s to
-scan with `licenses` using its default flags. The git-spdx timing covers the
-1.3 GB of blobs stored across the repository rather than only that tree.
+Both backends produced the same normalized output. The benchmark includes all
+stored history rather than only the files in the checked-out tree.
 
-## Benchmarks
+To benchmark other repositories:
 
 ```bash
 GITSPDX_BENCH_REPOS=/path/to/repo1:/path/to/repo2 \
   go test -run '^$' -bench BenchmarkScanHistory -benchtime 1x -benchmem
 ```
-
-Each repository runs once per backend (`catfile`, `gogit`). Reported
-metrics: blobs/op, hits/op, MB/op, µs/blob, heap_MiB, plus the standard
-ns/op, B/op, allocs/op. The matcher is loaded once and shared across all
-subtests; `BenchmarkMatcherLoad` measures that separately.
-
-Add `--cpuprofile` and `--memprofile` to the built binary's `scan` command
-for profiling a single run.
-
-## Limitations
-
-- `log` walks `--all` refs; shallow clones report every file as added at the
-  graft point (a warning is printed).
-- Merge diffs are omitted from `log` to avoid counting branch changes
-  again. Changes made only while resolving a merge are therefore omitted.
-  Legal-path discovery includes merge diffs against the first parent.
-- Binary blobs (containing NUL) are skipped.
-- Symlink blobs are scanned as text, so a target path that resembles license
-  text can produce a match.
-- `scan` includes unreachable objects in the object store. Legal-path
-  eligibility and `log` cover history reachable from refs.
-- Legal-path caps follow `licenses.LegalFileRoles`. Names such as
-  `license.rs` are included; `THIRD_PARTY_LICENSES.txt` and `PATENTS` are not.
-- No `blame` or `diff A..B` subcommands yet.
 
 ## License
 
