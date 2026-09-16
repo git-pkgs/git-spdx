@@ -459,6 +459,13 @@ func cli(t *testing.T, args ...string) string {
 	return string(out)
 }
 
+func TestCLIVersion(t *testing.T) {
+	out := cli(t, "--version")
+	if !strings.HasPrefix(out, "git-spdx version ") {
+		t.Fatalf("--version output = %q", out)
+	}
+}
+
 func TestCLI(t *testing.T) {
 	repo := repository(t)
 	commitFile(t, repo, "source.go", "// SPDX-License-Identifier: MIT\npackage example\n", "Add source")

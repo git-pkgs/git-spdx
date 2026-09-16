@@ -21,6 +21,7 @@ builds:
     mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - -s -w
+      - -X main.Version={{.Version}}
 
 archives:
   - formats: tar.gz
