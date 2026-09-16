@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"slices"
 	"sort"
@@ -42,6 +43,17 @@ const (
 	zeroOIDSHA256             = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
+var Version = "dev"
+
+func init() {
+	if Version != "dev" {
+		return
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		Version = bi.Main.Version
+	}
+}
+
 var (
 	cpuProfile    = newOption("")
 	memProfile    = newOption("")
@@ -69,6 +81,7 @@ func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:               "git-spdx",
 		Short:             "Find license changes across Git history",
+		Version:           Version,
 		SilenceErrors:     true,
 		SilenceUsage:      true,
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
