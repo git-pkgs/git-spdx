@@ -37,7 +37,7 @@ require (
 	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
 	github.com/go-git/go-git/v6 v6.0.0-alpha.4
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/package-url/packageurl-go v0.1.7 // indirect
 	github.com/pjbgf/sha1cd v0.6.0 // indirect
