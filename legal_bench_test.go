@@ -78,11 +78,11 @@ func BenchmarkCommitObjects(b *testing.B) {
 			b.ReportAllocs()
 			var count int
 			for b.Loop() {
-				repository, err := openGoGit(root)
+				repository, err := openHistory(root)
 				if err != nil {
 					b.Fatal(err)
 				}
-				iter, err := repository.CommitObjects()
+				iter, err := repository.Repository().CommitObjects()
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -113,41 +113,18 @@ func BenchmarkReachableCommitTrees(b *testing.B) {
 			b.ReportAllocs()
 			var count int
 			for b.Loop() {
-				repository, err := openGoGit(root)
+				repository, err := openHistory(root)
 				if err != nil {
 					b.Fatal(err)
 				}
-				roots, err := historyRoots(repository)
+				count = 0
+				err = repository.VisitCommitTrees(func(plumbing.Hash) error {
+					count++
+					return nil
+				})
 				if err != nil {
 					b.Fatal(err)
 				}
-				shallow, err := repository.Storer.Shallow()
-				if err != nil {
-					b.Fatal(err)
-				}
-				boundary := make(map[plumbing.Hash]bool, len(shallow))
-				for _, hash := range shallow {
-					boundary[hash] = true
-				}
-				seen := make(map[plumbing.Hash]struct{})
-				stack := append([]plumbing.Hash(nil), roots...)
-				for len(stack) > 0 {
-					last := len(stack) - 1
-					hash := stack[last]
-					stack = stack[:last]
-					if _, ok := seen[hash]; ok {
-						continue
-					}
-					commit, err := repository.CommitObject(hash)
-					if err != nil {
-						b.Fatal(err)
-					}
-					seen[hash] = struct{}{}
-					if !boundary[hash] {
-						stack = append(stack, commit.ParentHashes...)
-					}
-				}
-				count = len(seen)
 				if err := repository.Close(); err != nil {
 					b.Fatal(err)
 				}

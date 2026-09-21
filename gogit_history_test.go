@@ -5,12 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
-
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 func cliWithoutGit(t *testing.T, args ...string) string {
@@ -26,46 +22,6 @@ func cliWithoutGit(t *testing.T, args ...string) string {
 	return string(out)
 }
 
-func TestRawCommitLinksMatchDecodedCommits(t *testing.T) {
-	for _, format := range []string{testSHA1, testSHA256} {
-		t.Run(format, func(t *testing.T) {
-			repo := repository(t, "--object-format="+format)
-			commitFile(t, repo, "base.txt", "base\n", "Base")
-			git(t, repo, "switch", "-c", "side")
-			commitFile(t, repo, "side.txt", "side\n", "Side")
-			git(t, repo, "switch", "main")
-			commitFile(t, repo, "main.txt", "main\n", "Main")
-			git(t, repo, "merge", "--no-ff", "-m", "Merge", "side")
-			git(t, repo, "gc", "--quiet")
-
-			r, err := openGoGit(repo)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = r.Close() }()
-			iter, err := r.CommitObjects()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer iter.Close()
-			err = iter.ForEach(func(commit *object.Commit) error {
-				var parents []plumbing.Hash
-				tree, err := readCommitTreeAndParents(r, commit.Hash, true, &parents)
-				if err != nil {
-					return err
-				}
-				if tree != commit.TreeHash || !slices.Equal(parents, commit.ParentHashes) {
-					t.Fatalf("commit %s links differ", commit.Hash)
-				}
-				return nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
 func TestGitFreePackedHistory(t *testing.T) {
 	for _, format := range []string{"sha1", "sha256"} {
 		t.Run(format, func(t *testing.T) {
@@ -74,12 +30,12 @@ func TestGitFreePackedHistory(t *testing.T) {
 			commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Change license")
 			commitFile(t, repo, testLegalPath(), "SPDX-License-Identifier: MIT\n", "Add vendor notice")
 			git(t, repo, "gc", "--quiet")
-			want := cli(t, "log", repo, "--details")
-			got := cliWithoutGit(t, "log", repo, "--details")
+			want := cli(t, testLogCommand, repo, "--details")
+			got := cliWithoutGit(t, testLogCommand, repo, "--details")
 			if got != want {
 				t.Fatalf("history differs:\nwant:\n%s\ngot:\n%s", want, got)
 			}
-			out := cliWithoutGit(t, "scan", repo)
+			out := cliWithoutGit(t, testScanCommand, repo)
 			if metric(t, out, "blobs with hits") != 2 {
 				t.Fatal(out)
 			}
@@ -104,14 +60,40 @@ func TestGitFreeMergeLegalPathAndTag(t *testing.T) {
 	git(t, repo, "tag", "-a", "tag-only", "-m", "Tagged orphan")
 	git(t, repo, "switch", "main")
 	git(t, repo, "branch", "-D", "tagged")
-	args := []string{"scan", repo, "--max-blob-size=64", "--max-legal-blob-size=1024"}
+	args := []string{testScanCommand, repo, "--max-blob-size=64", "--max-legal-blob-size=1024"}
 	out := cliWithoutGit(t, args...)
 	if metric(t, out, "blobs with hits") != 2 || metric(t, out, "skipped: size") != 0 {
 		t.Fatal(out)
 	}
-	args = []string{"log", repo, "--max-blob-size=64", "--max-legal-blob-size=1024", "--monthly"}
+	args = []string{testLogCommand, repo, "--max-blob-size=64", "--max-legal-blob-size=1024", "--monthly"}
 	if got, want := cliWithoutGit(t, args...), cli(t, args...); got != want {
 		t.Fatalf("monthly counts differ:\n%s\n%s", got, want)
+	}
+}
+
+func TestGitFreeSharedSubtreeUsesRolesState(t *testing.T) {
+	repo := repository(t)
+	content := "SPDX-License-Identifier: MIT\n" + strings.Repeat("x\n", 100)
+	commitFile(t, repo, "docs/component.txt", content, "Add ordinary copy")
+	commitFile(t, repo, "licenses/component.txt", content, "Add legal copy")
+
+	var tree string
+	for _, directory := range []string{"docs", "licenses"} {
+		cmd := exec.Command("git", "-C", repo, "rev-parse", "HEAD:"+directory)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := strings.TrimSpace(string(out))
+		if tree != "" && current != tree {
+			t.Fatalf("tree for %s = %s, want shared tree %s", directory, current, tree)
+		}
+		tree = current
+	}
+
+	out := cliWithoutGit(t, testScanCommand, repo, "--max-blob-size=64", "--max-legal-blob-size=1024")
+	if metric(t, out, "blobs with hits") != 1 || metric(t, out, "skipped: size") != 0 {
+		t.Fatalf("shared subtree lost its legal occurrence:\n%s", out)
 	}
 }
 
@@ -126,8 +108,8 @@ func TestGitFreeBareWorktreeAndShallow(t *testing.T) {
 	shallow := filepath.Join(t.TempDir(), "shallow")
 	git(t, repo, "clone", "--depth=1", "file://"+repo, shallow)
 	for _, path := range []string{bare, worktree, shallow} {
-		want := cli(t, "log", path, "--details")
-		got := cliWithoutGit(t, "log", path, "--details")
+		want := cli(t, testLogCommand, path, "--details")
+		got := cliWithoutGit(t, testLogCommand, path, "--details")
 		if got != want {
 			t.Fatalf("history for %s differs:\nwant:\n%s\ngot:\n%s", path, want, got)
 		}
@@ -136,24 +118,30 @@ func TestGitFreeBareWorktreeAndShallow(t *testing.T) {
 
 func TestGitFreeEmptyRepository(t *testing.T) {
 	repo := repository(t)
-	if out := cliWithoutGit(t, "scan", repo); metric(t, out, "blobs seen") != 0 {
+	if out := cliWithoutGit(t, testScanCommand, repo); metric(t, out, "blobs seen") != 0 {
 		t.Fatal(out)
 	}
-	if out := cliWithoutGit(t, "log", repo); !strings.Contains(out, "root: 0 commits") {
+	if out := cliWithoutGit(t, testLogCommand, repo); !strings.Contains(out, "root: 0 commits") {
 		t.Fatal(out)
 	}
 }
 
-func TestGitFreeRejectsAlternateObjectStore(t *testing.T) {
+func TestGitFreeAlternateObjectStore(t *testing.T) {
 	repo := repository(t)
 	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: MIT\n", "Add license")
+	commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Change license")
+	git(t, repo, "gc", "--quiet")
 	shared := filepath.Join(t.TempDir(), "shared")
 	git(t, repo, "clone", "--shared", repo, shared)
-	cmd := exec.Command(os.Args[0], "scan", shared, "--backend=gogit")
-	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
-	out, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "does not support objects/info/alternates") {
-		t.Fatalf("alternate object store must not produce an empty success: %v\n%s", err, out)
+	want := cliWithoutGit(t, testScanCommand, repo)
+	got := cliWithoutGit(t, testScanCommand, shared)
+	for _, name := range []string{
+		"blobs seen", "blobs matched", "blobs with hits",
+		"skipped: size", "skipped: binary", "skipped: error",
+	} {
+		if gotMetric, wantMetric := metric(t, got, name), metric(t, want, name); gotMetric != wantMetric {
+			t.Fatalf("%s=%d, want %d\nsource:\n%s\nshared:\n%s", name, gotMetric, wantMetric, want, got)
+		}
 	}
 }
 
@@ -162,10 +150,10 @@ func TestGitFreeHistoryWithClockSkew(t *testing.T) {
 	for i, date := range []string{"2030-01-01T12:00:00Z", "2020-01-01T12:00:00Z", "2025-01-01T12:00:00Z"} {
 		t.Setenv("GIT_AUTHOR_DATE", date)
 		t.Setenv("GIT_COMMITTER_DATE", date)
-		content := []string{"MIT", "Apache-2.0", "BSD-3-Clause"}[i]
+		content := []string{mitExpression, testApache, "BSD-3-Clause"}[i]
 		commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: "+content+"\n", "License "+content)
 	}
-	if got, want := cliWithoutGit(t, "log", repo, "--details"), cli(t, "log", repo, "--details"); got != want {
+	if got, want := cliWithoutGit(t, testLogCommand, repo, "--details"), cli(t, testLogCommand, repo, "--details"); got != want {
 		t.Fatalf("clock-skewed history differs:\n%s\n%s", got, want)
 	}
 }
@@ -198,7 +186,7 @@ func TestGitFreeScanRejectsCorruptBlobChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, klauspost := range []bool{false, true} {
-		cmd = exec.Command(os.Args[0], "scan", repo, "--backend=gogit", "--readers=4", "--gogit-memory-index", fmt.Sprintf("--gogit-klauspost-zlib=%t", klauspost))
+		cmd = exec.Command(os.Args[0], testScanCommand, repo, "--backend=gogit", "--readers=4", "--gogit-memory-index", fmt.Sprintf("--gogit-klauspost-zlib=%t", klauspost))
 		cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
 		out, err := cmd.CombinedOutput()
 		if err == nil || !strings.Contains(string(out), "checksum") {

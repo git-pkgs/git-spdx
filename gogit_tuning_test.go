@@ -4,48 +4,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"sync"
 	"testing"
-
-	"github.com/go-git/go-git/v6/plumbing"
 )
 
-var (
-	benchmarkZlibOnce sync.Once
-	benchmarkZlibErr  error
-)
-
-func TestReadGoGitBlobReusesMemoryObjectContent(t *testing.T) {
-	obj := plumbing.NewMemoryObject(nil)
-	obj.SetType(plumbing.BlobObject)
-	if _, err := obj.Write([]byte("blob content")); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := readGoGitBlob(obj)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "blob content" {
-		t.Fatalf("content = %q", got)
-	}
-	if &got[0] != &obj.Bytes()[0] {
-		t.Fatal("memory object content was copied")
+func TestDefaultGoGitTuning(t *testing.T) {
+	got := goGitTuning()
+	if !got.Mmap || !got.KlauspostZlib {
+		t.Fatalf("default tuning = %+v", got)
 	}
 }
 
-func TestReadGoGitBlobRejectsMemoryObjectSizeMismatch(t *testing.T) {
-	obj := plumbing.NewMemoryObject(nil)
-	obj.SetType(plumbing.BlobObject)
-	if _, err := obj.Write([]byte("blob content")); err != nil {
-		t.Fatal(err)
+func TestDefaultGoGitReaders(t *testing.T) {
+	oldReaders := *readers
+	t.Cleanup(func() { *readers = oldReaders })
+	*readers = 0
+	if got, want := goGitReaders(), runtime.GOMAXPROCS(0); got != want {
+		t.Fatalf("readers = %d, want %d", got, want)
 	}
-	obj.SetSize(obj.Size() + 1)
+}
 
-	_, err := readGoGitBlob(obj)
-	if err == nil || !strings.Contains(err.Error(), "memory object size mismatch") {
-		t.Fatalf("error = %v", err)
+func TestDefaultHistoryWorkers(t *testing.T) {
+	if got, want := *historyWorkers, min(defaultHistoryWorkers, runtime.GOMAXPROCS(0)); got != want {
+		t.Fatalf("history workers = %d, want %d", got, want)
 	}
 }
 
@@ -53,7 +35,8 @@ func TestGitFreeTunedPackedScan(t *testing.T) {
 	for _, format := range []string{"sha1", "sha256"} {
 		t.Run(format, func(t *testing.T) {
 			repo := repository(t, "--object-format="+format)
-			for i := range 300 {
+			const sourceFiles = 1100
+			for i := range sourceFiles {
 				content := fmt.Sprintf("SPDX-License-Identifier: MIT\nunique=%d\n%s", i, strings.Repeat("sample source line\n", 100))
 				if err := os.WriteFile(filepath.Join(repo, fmt.Sprintf("file-%d.go", i)), []byte(content), 0600); err != nil {
 					t.Fatal(err)
@@ -62,13 +45,13 @@ func TestGitFreeTunedPackedScan(t *testing.T) {
 			git(t, repo, "add", ".")
 			commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Add source files")
 			git(t, repo, "repack", "-adq")
-			want := cli(t, "scan", repo)
-			if metric(t, want, "blobs seen") != 301 {
+			want := cli(t, testScanCommand, repo)
+			if metric(t, want, "blobs seen") != sourceFiles+1 {
 				t.Fatal(want)
 			}
 			for _, mode := range []string{"--gogit-memory-index", "--gogit-mmap"} {
 				for _, readers := range []string{"1", "2", "4"} {
-					args := []string{"scan", repo, "--readers=" + readers, mode, "--gogit-cache-bytes=536870912", "--gogit-cache-shards=8", "--gogit-object-buffer=64", "--gogit-object-batch=64"}
+					args := []string{testScanCommand, repo, "--readers=" + readers, mode, "--gogit-cache-bytes=536870912", "--gogit-cache-shards=8"}
 					got := cliWithoutGit(t, args...)
 					assertScanMetrics(t, got, want)
 				}
@@ -84,7 +67,7 @@ func assertScanMetrics(t *testing.T, got, want string) {
 			t.Fatalf("%s differs:\n%s\n%s", name, got, want)
 		}
 	}
-	if !strings.Contains(got, "MIT") || !strings.Contains(got, "Apache-2.0") {
+	if !strings.Contains(got, mitExpression) || !strings.Contains(got, testApache) {
 		t.Fatal(got)
 	}
 }
@@ -102,8 +85,8 @@ func TestGitFreeTunedHistoryLayouts(t *testing.T) {
 	git(t, repo, "clone", "--depth=1", "file://"+repo, shallow)
 	for _, path := range []string{repo, bare, worktree, shallow} {
 		for _, mode := range []string{"--gogit-memory-index", "--gogit-mmap"} {
-			got := cliWithoutGit(t, "log", path, "--readers=4", mode, "--gogit-cache-bytes=536870912", "--details")
-			if want := cli(t, "log", path, "--details"); got != want {
+			got := cliWithoutGit(t, testLogCommand, path, "--readers=4", mode, "--gogit-cache-bytes=536870912", "--details")
+			if want := cli(t, testLogCommand, path, "--details"); got != want {
 				t.Fatalf("history differs for %s:\n%s\n%s", path, got, want)
 			}
 		}
@@ -178,42 +161,6 @@ func BenchmarkGoGitCacheReaders4(b *testing.B) {
 		for _, mib := range []uint64{96, 256, 576} {
 			*goGitCacheBytes = mib << 20
 			b.Run(fmt.Sprintf("%dMiB", mib), func(b *testing.B) {
-				benchmarkTunedFeed(b, root)
-			})
-		}
-	}
-}
-
-func BenchmarkGoGitObjectInfos(b *testing.B) {
-	if os.Getenv("GITSPDX_BENCH_KLAUSPOST") == "1" {
-		benchmarkZlibOnce.Do(func() {
-			*goGitKlauspostZlib = true
-			benchmarkZlibErr = configureGoGitZlib()
-		})
-		if benchmarkZlibErr != nil {
-			b.Fatal(benchmarkZlibErr)
-		}
-	}
-	oldBackend, oldReaders, oldMemory, oldCache, oldMmap, oldObjectInfos := *backend, *readers, *goGitMemoryIndex, *goGitCacheBytes, *goGitMmap, *goGitObjectInfos
-	oldBuffer, oldBatch := *goGitObjectBuffer, *goGitObjectBatch
-	b.Cleanup(func() {
-		*backend, *readers, *goGitMemoryIndex, *goGitCacheBytes = oldBackend, oldReaders, oldMemory, oldCache
-		*goGitMmap, *goGitObjectInfos = oldMmap, oldObjectInfos
-		*goGitObjectBuffer = oldBuffer
-		*goGitObjectBatch = oldBatch
-	})
-	*backend, *readers, *goGitMemoryIndex, *goGitCacheBytes, *goGitMmap = goGitBackend, 8, false, 96<<20, true
-	*goGitObjectBuffer, *goGitObjectBatch = 64, 64
-	for _, mode := range []struct {
-		name  string
-		infos bool
-	}{
-		{name: "eager", infos: false},
-		{name: "metadata", infos: true},
-	} {
-		*goGitObjectInfos = mode.infos
-		for _, root := range benchmarkRepositoryRoots(b) {
-			b.Run(mode.name+"/"+filepath.Base(filepath.Clean(root)), func(b *testing.B) {
 				benchmarkTunedFeed(b, root)
 			})
 		}

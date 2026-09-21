@@ -1,18 +1,15 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/csv"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 
+	githistory "github.com/git-pkgs/history"
 	"github.com/git-pkgs/licenses"
 )
 
@@ -34,77 +31,10 @@ func walkChanges(repo string, merges bool, visit func(change)) error {
 	if *backend == goGitBackend {
 		return walkChangesGoGit(repo, merges, visit)
 	}
-	mergeMode := "off"
-	if merges {
-		mergeMode = "first-parent"
-	}
-	cmd := exec.Command("git", "-C", repo, "log", "--all", "--date-order",
-		"--root", "--no-abbrev", "--raw", "--no-renames", "-z",
-		"--diff-merges="+mergeMode, "--format=%x01%H%x00%aI%x00%P%x00%s")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	err = readChanges(stdout, visit)
-	if err != nil {
-		_ = cmd.Process.Kill()
-	}
-	waitErr := cmd.Wait()
-	if err != nil {
-		return fmt.Errorf("read history: %w", err)
-	}
-	return waitErr
-}
-
-func readChanges(input io.Reader, visit func(change)) error {
-	r := bufio.NewReaderSize(input, readerBufferSize)
-	field := func() (string, error) {
-		s, err := r.ReadString(0)
-		return strings.TrimSuffix(s, "\x00"), err
-	}
-	var c change
-	for {
-		token, err := field()
-		if err == io.EOF && strings.TrimSpace(token) == "" {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		token = strings.TrimLeft(token, "\n")
-		if strings.HasPrefix(token, "\x01") {
-			c.commit = token[1:]
-			if c.date, err = field(); err != nil {
-				return err
-			}
-			parents, err := field()
-			if err != nil {
-				return err
-			}
-			c.merge = strings.Contains(parents, " ")
-			if c.subject, err = field(); err != nil {
-				return err
-			}
-			continue
-		}
-		if !strings.HasPrefix(token, ":") {
-			continue
-		}
-		fields := strings.Fields(token[1:])
-		if len(fields) != 5 || c.commit == "" {
-			return fmt.Errorf("invalid raw change %q", token)
-		}
-		c.oldMode, c.newMode = fields[0], fields[1]
-		c.oldOID, c.newOID = fields[2], fields[3]
-		if c.path, err = field(); err != nil {
-			return err
-		}
-		visit(c)
-	}
+	return githistory.WalkChangesGit(repo, merges, func(c githistory.Change) error {
+		visit(changeFromHistory(c))
+		return nil
+	})
 }
 
 func pathGroup(path string) string {
@@ -207,6 +137,11 @@ func logCmd(repo string) error {
 	if *monthly {
 		return printMonthly(months)
 	}
+	printHistoryTotals(totals)
+	return nil
+}
+
+func printHistoryTotals(totals map[string]*historyTotals) {
 	for _, role := range []string{groupRoot, groupLegal, groupOther} {
 		if *group != groupAll && *group != role {
 			continue
@@ -215,15 +150,13 @@ func logCmd(repo string) error {
 		fmt.Printf("%s: %d commits; %d expression changes; %d file additions; %d file deletions; %d incomplete comparisons; %d SPDX declarations added; %d removed\n",
 			role, t.commits, t.expressions, t.additions, t.deletions, t.incomplete, t.spdxAdded, t.spdxRemoved)
 	}
-	return nil
 }
 
 func isShallow(repo string) (bool, error) {
 	if *backend == goGitBackend {
 		return isShallowGoGit(repo)
 	}
-	out, err := exec.Command("git", "-C", repo, "rev-parse", "--is-shallow-repository").Output()
-	return bytes.HasPrefix(out, []byte("true")), err
+	return githistory.ShallowGit(repo)
 }
 
 func printChange(c change, role, kind string, before, after blobResult) {

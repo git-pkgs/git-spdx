@@ -5,7 +5,9 @@ go 1.26.0
 toolchain go1.26.7
 
 require (
+	github.com/git-pkgs/history v0.1.1
 	github.com/git-pkgs/licenses v0.8.0
+	github.com/git-pkgs/roles v0.0.0-20260917090927-eb44e8aa553d
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -34,10 +36,10 @@ require (
 	github.com/git-pkgs/spdx v0.3.2 // indirect
 	github.com/git-pkgs/vers v0.7.0 // indirect
 	github.com/github/go-spdx/v2 v2.7.0 // indirect
-	github.com/go-git/go-billy/v6 v6.0.0-alpha.2
-	github.com/go-git/go-git/v6 v6.0.0-alpha.4
+	github.com/go-git/go-billy/v6 v6.0.0-alpha.2 // indirect
+	github.com/go-git/go-git/v6 v6.0.0-alpha.5
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
-	github.com/klauspost/compress v1.20.0
+	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/package-url/packageurl-go v0.1.7 // indirect
 	github.com/pjbgf/sha1cd v0.6.0 // indirect
@@ -47,7 +49,3 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/go-git/go-git/v6 => github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260906204421-52ea7303c392
-
-replace github.com/go-git/go-billy/v6 => github.com/git-pkgs/go-billy/v6 v6.0.0-alpha.2.0.20260906202738-23c9d86c8d17

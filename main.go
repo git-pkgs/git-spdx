@@ -22,8 +22,6 @@ import (
 	"time"
 
 	"github.com/git-pkgs/licenses"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/spf13/cobra"
 )
 
@@ -35,8 +33,6 @@ const (
 	initialExpressionCapacity = 128
 	readerBufferSize          = 1 << 16
 	jobQueueSize              = 256
-	jobBatchSize              = 64
-	jobBatchBytes             = 8 << 20
 	catHeaderFields           = 3
 	expressionDisplayLimit    = 20
 	zeroOID                   = "0000000000000000000000000000000000000000"
@@ -134,17 +130,14 @@ func addSharedFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 	flags.StringVar(backend, "backend", "git", "backend: git (subprocesses) or gogit (Git-free)")
 	flags.Int64Var(maxBlobSize, "max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
-	flags.IntVar(readers, "readers", 0, "blob readers (0 = GOMAXPROCS for git, 1 for gogit)")
+	flags.IntVar(readers, "readers", 0, "blob readers (0 = GOMAXPROCS)")
 	flags.Int64Var(legalBlobSize, "max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
-	flags.BoolVar(goGitMemoryIndex, "gogit-memory-index", false, "load pack indexes into memory")
-	flags.BoolVar(goGitMmap, "gogit-mmap", false, "memory-map read-only pack and index files")
-	flags.Uint64Var(goGitCacheBytes, "gogit-cache-bytes", uint64(cache.DefaultMaxSize), "go-git object cache capacity in bytes")
-	flags.IntVar(goGitCacheShards, "gogit-cache-shards", 1, "go-git object cache shards")
-	flags.BoolVar(goGitObjectInfos, "gogit-object-infos", true, "enumerate go-git object metadata before loading blobs")
-	flags.IntVar(goGitObjectBuffer, "gogit-object-buffer", defaultGoGitObjectBuffer, "buffered go-git object metadata entries")
-	flags.IntVar(goGitObjectBatch, "gogit-object-batch", defaultGoGitObjectBatch, "adjacent go-git object metadata entries per reader task")
-	flags.BoolVar(goGitKlauspostZlib, "gogit-klauspost-zlib", false, "use klauspost zlib for go-git object decompression")
-	flags.IntVar(historyWorkers, "history-workers", 1, "go-git history workers")
+	flags.BoolVar(goGitMemoryIndex, "gogit-memory-index", defaultGoGitTuning.MemoryIndex, "load pack indexes into memory")
+	flags.BoolVar(goGitMmap, "gogit-mmap", defaultGoGitTuning.Mmap, "memory-map read-only pack and index files")
+	flags.Uint64Var(goGitCacheBytes, "gogit-cache-bytes", defaultGoGitTuning.CacheBytes, "go-git object cache capacity in bytes")
+	flags.IntVar(goGitCacheShards, "gogit-cache-shards", defaultGoGitTuning.CacheShards, "go-git object cache shards")
+	flags.BoolVar(goGitKlauspostZlib, "gogit-klauspost-zlib", defaultGoGitTuning.KlauspostZlib, "use klauspost zlib for go-git object decompression")
+	flags.IntVar(historyWorkers, "history-workers", min(defaultHistoryWorkers, runtime.GOMAXPROCS(0)), "go-git history workers")
 }
 
 func validateOptions(history bool) error {
@@ -154,19 +147,13 @@ func validateOptions(history bool) error {
 	if *maxBlobSize < 0 || *legalBlobSize < 0 {
 		return fmt.Errorf("blob size limits must be non-negative")
 	}
-	if *goGitObjectBuffer < 0 {
-		return fmt.Errorf("go-git object buffer must be non-negative")
-	}
-	if *goGitObjectBatch <= 0 {
-		return fmt.Errorf("go-git object batch must be positive")
-	}
 	if history && !slices.Contains([]string{groupAll, groupRoot, groupLegal, groupOther}, *group) {
 		return fmt.Errorf("unknown history group %q", *group)
 	}
 	if history && *monthly && *details {
 		return fmt.Errorf("--monthly and --details cannot be combined")
 	}
-	return configureGoGitZlib()
+	return nil
 }
 
 func repositoryArgument(args []string) string {
@@ -514,73 +501,6 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 		}
 	}
 	return total, err
-}
-
-func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
-	if *readers > 1 {
-		return feedBlobsGoGitParallel(repo, jobs, skip, limit, *readers)
-	}
-	return feedBlobsGoGitSerial(repo, jobs, skip, limit)
-}
-
-func feedBlobsGoGitSerial(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
-	r, err := openGoGit(repo)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = r.Close() }()
-	iter, err := r.Storer.IterEncodedObjects(plumbing.BlobObject)
-	if err != nil {
-		return 0, err
-	}
-	defer iter.Close()
-	total := 0
-	batch := make([]job, 0, jobBatchSize)
-	batchBytes := 0
-	flush := func() {
-		for _, j := range batch {
-			jobs <- j
-		}
-		batch = batch[:0]
-		batchBytes = 0
-	}
-	for {
-		obj, err := iter.Next()
-		if err == io.EOF {
-			flush()
-			return total, nil
-		}
-		if err != nil {
-			return total, err
-		}
-		total++
-		oid := obj.Hash().String()
-		if obj.Size() > limit(oid) {
-			skip(oid)
-			continue
-		}
-		rd, err := obj.Reader()
-		if err != nil {
-			return total, err
-		}
-		data := make([]byte, obj.Size())
-		_, err = io.ReadFull(rd, data)
-		closeErr := rd.Close()
-		if err != nil {
-			return total, err
-		}
-		if closeErr != nil {
-			return total, closeErr
-		}
-		if len(batch) > 0 && batchBytes+len(data) > jobBatchBytes {
-			flush()
-		}
-		batch = append(batch, job{oid: oid, data: data})
-		batchBytes += len(data)
-		if len(batch) == cap(batch) {
-			flush()
-		}
-	}
 }
 
 func matchBlob(ctx context.Context, m *licenses.Matcher, data []byte) blobResult {
