@@ -157,4 +157,4 @@ GITSPDX_BENCH_REPOS=/path/to/repo1:/path/to/repo2 \
 
 ## License
 
-MIT
+[MIT](LICENSE).
