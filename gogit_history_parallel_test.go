@@ -26,16 +26,16 @@ func TestGitFreeParallelHistory(t *testing.T) {
 				date := fmt.Sprintf("2025-01-%02dT12:00:00Z", 13-n)
 				t.Setenv("GIT_AUTHOR_DATE", date)
 				t.Setenv("GIT_COMMITTER_DATE", date)
-				license := []string{"MIT", testApache}[n%2]
+				license := []string{mitExpression, testApache}[n%2]
 				commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: "+license+"\n", fmt.Sprintf("Change %d", n))
 			}
 			git(t, repo, "gc", "--quiet")
 			for _, workers := range []string{"2", "4"} {
 				args := []string{"--history-workers=" + workers, testMmapFlag, "--readers=4"}
 				for _, mode := range []string{"--details", "--monthly"} {
-					commandArgs := append([]string{"log", repo}, args...)
+					commandArgs := append([]string{testLogCommand, repo}, args...)
 					got := cliWithoutGit(t, append(commandArgs, mode)...)
-					want := cli(t, "log", repo, mode)
+					want := cli(t, testLogCommand, repo, mode)
 					if got != want {
 						t.Fatalf("history differs:\n%s\n%s", got, want)
 					}
@@ -59,16 +59,20 @@ func TestGitFreeParallelHistoryMissingTree(t *testing.T) {
 	if err := os.Remove(filepath.Join(repo, ".git", "objects", hash[:2], hash[2:])); err != nil {
 		t.Fatal(err)
 	}
+	cmd = exec.Command("git", "-C", repo, "cat-file", "-e", hash)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("tree %s remains readable after removing its loose object:\n%s", hash, out)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, os.Args[0], "scan", repo, "--backend=gogit", "--history-workers=4")
+	cmd = exec.CommandContext(ctx, os.Args[0], testScanCommand, repo, "--backend=gogit", "--history-workers=4")
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "PATH="+t.TempDir())
 	out, err = cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		t.Fatal("history workers did not terminate")
 	}
 	if err == nil || !strings.Contains(string(out), "object not found") {
-		t.Fatalf("missing tree accepted: %v\n%s", err, out)
+		t.Fatalf("missing tree %s accepted: %v\n%s", hash, err, out)
 	}
 }
 
@@ -77,7 +81,7 @@ func BenchmarkParallelHistory(b *testing.B) {
 	b.Cleanup(func() { *backend, *goGitMmap, *historyWorkers = oldBackend, oldMmap, oldWorkers })
 	*backend, *goGitMmap = goGitBackend, true
 	for _, root := range benchmarkRepositoryRoots(b) {
-		for _, workers := range []int{1, 2, 4} {
+		for _, workers := range []int{1, 2, 4, 8} {
 			*historyWorkers = workers
 			b.Run(fmt.Sprint(workers), func(b *testing.B) {
 				b.ReportAllocs()
