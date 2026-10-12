@@ -5,18 +5,16 @@ go 1.26.0
 toolchain go1.26.7
 
 require (
-	github.com/git-pkgs/licenses v0.8.0
+	github.com/git-pkgs/licenses v0.9.0
 	github.com/spf13/cobra v1.10.2
 )
 
 require (
 	github.com/go-git/gcfg/v2 v2.0.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/kr/pretty v0.3.1 // indirect
-	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 )
 
 require (
@@ -27,8 +25,8 @@ require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
-	github.com/git-pkgs/magic v0.3.1 // indirect
-	github.com/git-pkgs/manifests v0.12.0 // indirect
+	github.com/git-pkgs/magic v0.4.0 // indirect
+	github.com/git-pkgs/manifests v0.12.2 // indirect
 	github.com/git-pkgs/pom v0.1.7 // indirect
 	github.com/git-pkgs/purl v0.1.20 // indirect
 	github.com/git-pkgs/spdx v0.3.2 // indirect
@@ -45,7 +43,6 @@ require (
 	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace github.com/go-git/go-git/v6 => github.com/git-pkgs/go-git/v6 v6.0.0-alpha.4.0.20260906204421-52ea7303c392
