@@ -21,8 +21,8 @@ const (
 )
 
 var (
-	goGitMemoryIndex  = newOption(false)
-	goGitMmap         = newOption(false)
+	goGitMemoryIndex  = newOption(true)
+	goGitMmap         = newOption(true)
 	goGitCacheBytes   = newOption(uint64(cache.DefaultMaxSize))
 	goGitCacheShards  = newOption(1)
 	goGitObjectInfos  = newOption(true)

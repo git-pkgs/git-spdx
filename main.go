@@ -134,17 +134,17 @@ func addSharedFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 	flags.StringVar(backend, "backend", "git", "backend: git (subprocesses) or gogit (Git-free)")
 	flags.Int64Var(maxBlobSize, "max-blob-size", defaultMaxBlobSize, "skip blobs larger than this many bytes")
-	flags.IntVar(readers, "readers", 0, "blob readers (0 = GOMAXPROCS for git, 1 for gogit)")
+	flags.IntVar(readers, "readers", 0, "blob readers (0 = GOMAXPROCS)")
 	flags.Int64Var(legalBlobSize, "max-legal-blob-size", defaultLegalBlobSize, "size limit for blobs used at legal paths")
-	flags.BoolVar(goGitMemoryIndex, "gogit-memory-index", false, "load pack indexes into memory")
-	flags.BoolVar(goGitMmap, "gogit-mmap", false, "memory-map read-only pack and index files")
+	flags.BoolVar(goGitMemoryIndex, "gogit-memory-index", true, "load pack indexes into memory")
+	flags.BoolVar(goGitMmap, "gogit-mmap", true, "memory-map read-only pack and index files where supported")
 	flags.Uint64Var(goGitCacheBytes, "gogit-cache-bytes", uint64(cache.DefaultMaxSize), "go-git object cache capacity in bytes")
 	flags.IntVar(goGitCacheShards, "gogit-cache-shards", 1, "go-git object cache shards")
 	flags.BoolVar(goGitObjectInfos, "gogit-object-infos", true, "enumerate go-git object metadata before loading blobs")
 	flags.IntVar(goGitObjectBuffer, "gogit-object-buffer", defaultGoGitObjectBuffer, "buffered go-git object metadata entries")
 	flags.IntVar(goGitObjectBatch, "gogit-object-batch", defaultGoGitObjectBatch, "adjacent go-git object metadata entries per reader task")
 	flags.BoolVar(goGitKlauspostZlib, "gogit-klauspost-zlib", false, "use klauspost zlib for go-git object decompression")
-	flags.IntVar(historyWorkers, "history-workers", 1, "go-git history workers")
+	flags.IntVar(historyWorkers, "history-workers", 0, "go-git history workers (0 = GOMAXPROCS, at most 8)")
 }
 
 func validateOptions(history bool) error {
@@ -455,11 +455,7 @@ func feederFor(name string) feeder {
 func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	shards := *readers
-	if shards <= 0 {
-		shards = runtime.GOMAXPROCS(0)
-	}
-	shards = max(1, shards)
+	shards := blobReaders()
 	blobs := make(chan listedBlob, jobQueueSize)
 	var wg sync.WaitGroup
 	errs := make(chan error, shards)
@@ -516,9 +512,18 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 	return total, err
 }
 
+// blobReaders returns the blob reader count for either backend, using
+// GOMAXPROCS when --readers is 0.
+func blobReaders() int {
+	if *readers > 0 {
+		return *readers
+	}
+	return runtime.GOMAXPROCS(0)
+}
+
 func feedBlobsGoGit(repo string, jobs chan<- job, skip func(string), limit func(string) int64) (int, error) {
-	if *readers > 1 {
-		return feedBlobsGoGitParallel(repo, jobs, skip, limit, *readers)
+	if workers := blobReaders(); workers > 1 {
+		return feedBlobsGoGitParallel(repo, jobs, skip, limit, workers)
 	}
 	return feedBlobsGoGitSerial(repo, jobs, skip, limit)
 }

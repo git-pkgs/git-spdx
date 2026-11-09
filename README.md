@@ -131,8 +131,10 @@ git spdx log --backend=gogit --details
 git spdx scan --backend=gogit
 ```
 
-Run either command with `--help` to see cache, mmap, object reader, and history
-worker controls for the Git-free backend.
+By default it loads pack indexes into memory, memory-maps pack files where the
+platform supports it, and runs `GOMAXPROCS` blob readers and up to eight
+history workers. Run either command with `--help` to see cache, mmap, object
+reader, and history worker controls for the Git-free backend.
 
 ## Performance
 

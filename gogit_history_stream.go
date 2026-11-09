@@ -180,8 +180,8 @@ func walkChangesGoGitStream(r *gogit.Repository, merges bool, visit func(change)
 		return err
 	}
 	cache := newHistoryTreeCache()
-	if *historyWorkers > 1 {
-		return visitHistoryStreamParallel(iter, cache, merges, visit, *historyWorkers)
+	if workers := resolvedHistoryWorkers(); workers > 1 {
+		return visitHistoryStreamParallel(iter, cache, merges, visit, workers)
 	}
 	for {
 		node, err := iter.Next()
@@ -398,13 +398,14 @@ func legalBlobsGoGit(path string) (map[string]bool, error) {
 		boundary[hash] = true
 	}
 	collector := newLegalTreeCollector()
-	if *historyWorkers <= 1 {
+	workers := resolvedHistoryWorkers()
+	if workers <= 1 {
 		err = visitCommitTrees(r, roots, boundary, func(hash plumbing.Hash) error {
 			return collectLegalTreeRaw(r, hash, false, collector)
 		})
 		return collector.legal, err
 	}
-	err = collectLegalTreesParallel(r, roots, boundary, collector, *historyWorkers-1)
+	err = collectLegalTreesParallel(r, roots, boundary, collector, workers-1)
 	return collector.legal, err
 }
 

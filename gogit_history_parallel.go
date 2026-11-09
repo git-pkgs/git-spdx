@@ -1,8 +1,23 @@
 package main
 
-var historyWorkers = newOption(1)
+import "runtime"
+
+var historyWorkers = newOption(0)
 
 const historyLookahead = 2
+
+// maxAutoHistoryWorkers caps --history-workers=0. On cargo's history the walk
+// stopped getting faster beyond 4-8 workers and slowed slightly at 18.
+const maxAutoHistoryWorkers = 8
+
+// resolvedHistoryWorkers returns the go-git history worker count, choosing one
+// from GOMAXPROCS when --history-workers is 0.
+func resolvedHistoryWorkers() int {
+	if *historyWorkers > 0 {
+		return *historyWorkers
+	}
+	return min(runtime.GOMAXPROCS(0), maxAutoHistoryWorkers)
+}
 
 type historyResult struct {
 	changes []change
