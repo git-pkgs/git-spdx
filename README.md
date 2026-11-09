@@ -6,8 +6,8 @@ removed, and when `SPDX-License-Identifier` declarations appear or disappear,
 with the commit and path behind each change.
 It scans large histories in seconds. That speed makes it practical to trace
 license evidence through every revision, even in a large repository.
-On an 8-core M1 Pro, the default native Git backend scanned 1.3 GB of blobs
-across Cargo's 23,190 commits in an average of 4.05 seconds.
+On an 18-core M5 Max, the default native Git backend scanned 1.42 GB of blobs
+across Cargo's 23,683 commits in an average of 1.61 seconds.
 
 The `licenses` command reports what the current checkout contains. `git-spdx`
 adds the timeline, so it can answer questions such as:
@@ -138,14 +138,18 @@ reader, and history worker controls for the Git-free backend.
 
 ## Performance
 
-On an 8-core M1 Pro with 16 GB of memory, a full clone of `rust-lang/cargo` at
-`a07c49a` contained 23,190 commits and 1.3 GB of historical blobs. Two-run
-averages were:
+On an 18-core M5 Max (6 performance, 12 efficiency) with 64 GB of memory, a
+clone of `rust-lang/cargo` with history up to `a07c49a` contained 23,683
+commits and 1.42 GB of historical blobs. Five-run averages of `scan` with
+default flags were:
 
 | Backend | Wall time | CPU time | Peak process-tree RSS |
 | --- | ---: | ---: | ---: |
-| Native Git | 4.05 s | 20.03 s | 2.12 GiB |
-| Git-free | 3.57 s | 20.14 s | 614 MiB |
+| Native Git | 1.61 s | 14.50 s | 3.81 GiB |
+| Git-free | 1.49 s | 13.29 s | 896 MiB |
+
+The native backend starts one `git cat-file` process per reader, so its memory
+grows with core count. Pass `--readers` to limit it.
 
 Both backends produced the same normalized output. The benchmark includes all
 stored history rather than only the files in the checked-out tree.
