@@ -16,6 +16,13 @@ var (
 	benchmarkZlibErr  error
 )
 
+var goGitIndexModes = [][]string{
+	{"--gogit-memory-index=true", "--gogit-mmap=true"},
+	{"--gogit-memory-index=true", "--gogit-mmap=false"},
+	{"--gogit-memory-index=false", "--gogit-mmap=true"},
+	{"--gogit-memory-index=false", "--gogit-mmap=false"},
+}
+
 func TestReadGoGitBlobReusesMemoryObjectContent(t *testing.T) {
 	obj := plumbing.NewMemoryObject(nil)
 	obj.SetType(plumbing.BlobObject)
@@ -66,10 +73,10 @@ func TestGitFreeTunedPackedScan(t *testing.T) {
 			if metric(t, want, "blobs seen") != 301 {
 				t.Fatal(want)
 			}
-			for _, mode := range []string{"--gogit-memory-index", "--gogit-mmap"} {
-				for _, readers := range []string{"1", "2", "4"} {
-					args := []string{"scan", repo, "--readers=" + readers, mode, "--gogit-cache-bytes=536870912", "--gogit-cache-shards=8", "--gogit-object-buffer=64", "--gogit-object-batch=64"}
-					got := cliWithoutGit(t, args...)
+			for _, mode := range goGitIndexModes {
+				for _, readers := range []string{"0", "1", "2", "4"} {
+					args := []string{"scan", repo, "--readers=" + readers, "--gogit-cache-bytes=536870912", "--gogit-cache-shards=8", "--gogit-object-buffer=64", "--gogit-object-batch=64"}
+					got := cliWithoutGit(t, append(args, mode...)...)
 					assertScanMetrics(t, got, want)
 				}
 			}
@@ -101,8 +108,9 @@ func TestGitFreeTunedHistoryLayouts(t *testing.T) {
 	shallow := filepath.Join(t.TempDir(), "shallow")
 	git(t, repo, "clone", "--depth=1", "file://"+repo, shallow)
 	for _, path := range []string{repo, bare, worktree, shallow} {
-		for _, mode := range []string{"--gogit-memory-index", "--gogit-mmap"} {
-			got := cliWithoutGit(t, "log", path, "--readers=4", mode, "--gogit-cache-bytes=536870912", "--details")
+		for _, mode := range goGitIndexModes {
+			args := []string{"log", path, "--readers=4", "--gogit-cache-bytes=536870912", "--details"}
+			got := cliWithoutGit(t, append(args, mode...)...)
 			if want := cli(t, "log", path, "--details"); got != want {
 				t.Fatalf("history differs for %s:\n%s\n%s", path, got, want)
 			}
@@ -123,7 +131,7 @@ func BenchmarkGoGitTuning(b *testing.B) {
 			cache  uint64
 			mmap   bool
 		}{
-			{"default", false, 96 << 20, false},
+			{"lazy", false, 96 << 20, false},
 			{"memory", true, 96 << 20, false},
 			{"mmap", false, 96 << 20, true},
 		} {

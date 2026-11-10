@@ -10,8 +10,6 @@ const historyLookahead = 2
 // stopped getting faster beyond 4-8 workers and slowed slightly at 18.
 const maxAutoHistoryWorkers = 8
 
-// resolvedHistoryWorkers returns the go-git history worker count, choosing one
-// from GOMAXPROCS when --history-workers is 0.
 func resolvedHistoryWorkers() int {
 	if *historyWorkers > 0 {
 		return *historyWorkers

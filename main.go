@@ -512,8 +512,6 @@ func feedBlobsCatFile(repo string, jobs chan<- job, skip func(string), limit fun
 	return total, err
 }
 
-// blobReaders returns the blob reader count for either backend, using
-// GOMAXPROCS when --readers is 0.
 func blobReaders() int {
 	if *readers > 0 {
 		return *readers
