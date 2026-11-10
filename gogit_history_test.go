@@ -16,7 +16,10 @@ import (
 func cliWithoutGit(t *testing.T, args ...string) string {
 	t.Helper()
 	commandArgs := append([]string{}, args...)
-	commandArgs = append(commandArgs, "--backend=gogit", "--history-workers=4")
+	commandArgs = append(commandArgs, "--backend=gogit")
+	if !slices.ContainsFunc(args, func(arg string) bool { return strings.HasPrefix(arg, "--history-workers") }) {
+		commandArgs = append(commandArgs, "--history-workers=4")
+	}
 	cmd := exec.Command(os.Args[0], commandArgs...)
 	cmd.Env = append(os.Environ(), "GIT_SPDX_TEST_CLI=1", "GOMAXPROCS=2", "PATH="+t.TempDir())
 	out, err := cmd.CombinedOutput()

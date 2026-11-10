@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestGitFreeParallelHistory(t *testing.T) {
 				commitFile(t, repo, "LICENSE", "SPDX-License-Identifier: "+license+"\n", fmt.Sprintf("Change %d", n))
 			}
 			git(t, repo, "gc", "--quiet")
-			for _, workers := range []string{"2", "4"} {
+			for _, workers := range []string{"0", "1", "2", "4"} {
 				args := []string{"--history-workers=" + workers, testMmapFlag, "--readers=4"}
 				for _, mode := range []string{"--details", "--monthly"} {
 					commandArgs := append([]string{"log", repo}, args...)
@@ -42,6 +43,32 @@ func TestGitFreeParallelHistory(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAutoWorkerCounts(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(0)
+	oldWorkers, oldReaders := *historyWorkers, *readers
+	t.Cleanup(func() {
+		runtime.GOMAXPROCS(oldProcs)
+		*historyWorkers, *readers = oldWorkers, oldReaders
+	})
+	for _, test := range []struct {
+		procs, flag, wantHistory, wantReaders int
+	}{
+		{procs: 2, flag: 0, wantHistory: 2, wantReaders: 2},
+		{procs: 16, flag: 0, wantHistory: maxAutoHistoryWorkers, wantReaders: 16},
+		{procs: 2, flag: 12, wantHistory: 12, wantReaders: 12},
+		{procs: 16, flag: 1, wantHistory: 1, wantReaders: 1},
+	} {
+		runtime.GOMAXPROCS(test.procs)
+		*historyWorkers, *readers = test.flag, test.flag
+		if got := resolvedHistoryWorkers(); got != test.wantHistory {
+			t.Errorf("GOMAXPROCS=%d --history-workers=%d: got %d, want %d", test.procs, test.flag, got, test.wantHistory)
+		}
+		if got := blobReaders(); got != test.wantReaders {
+			t.Errorf("GOMAXPROCS=%d --readers=%d: got %d, want %d", test.procs, test.flag, got, test.wantReaders)
+		}
 	}
 }
 
